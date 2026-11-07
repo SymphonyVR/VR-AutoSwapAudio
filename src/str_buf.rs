@@ -218,7 +218,6 @@ pub fn utf8_to_utf16_null(utf8: &[u8], out: &mut [u16]) -> usize {
 
 /// Pure-#![no_std] Windows command-line parser (replaces Shell32's `CommandLineToArgvW`).
 /// Skips `argv[0]` (the executable path) and writes up to `out_args.len()` UTF-8 arguments.
-#[cfg(target_os = "windows")]
 pub fn parse_windows_cmdline_utf16(cmd: &[u16], out_args: &mut [FixedBuf<128>; 8]) -> usize {
     let mut i = 0usize;
     let n = cmd.len();
