@@ -1180,6 +1180,78 @@ impl RoleSnapshots {
             );
         }
     }
+
+    unsafe fn sanitize_against_vr(
+        &mut self,
+        enumerator: *mut IMMDeviceEnumerator,
+        profile: &VrAudioProfile,
+        custom_out: &[u8],
+        custom_in: &[u8],
+    ) {
+        unsafe {
+            let mut vr_out_id = FixedBuf::<160>::new();
+            let mut vr_out_name = FixedBuf::<160>::new();
+            let mut desk_out_id = FixedBuf::<160>::new();
+            let mut desk_out_name = FixedBuf::<160>::new();
+            resolve_active_endpoints(
+                enumerator,
+                E_RENDER,
+                profile,
+                custom_out,
+                &mut vr_out_id,
+                &mut vr_out_name,
+                &mut desk_out_id,
+                &mut desk_out_name,
+            );
+            let fallback_out = if !profile.desktop_playback_id.is_empty() {
+                profile.desktop_playback_id.as_bytes()
+            } else {
+                desk_out_id.as_bytes()
+            };
+            Self::fix_if_vr(&mut self.render_console, vr_out_id.as_bytes(), profile, fallback_out);
+            Self::fix_if_vr(&mut self.render_multimedia, vr_out_id.as_bytes(), profile, fallback_out);
+            Self::fix_if_vr(&mut self.render_comm, vr_out_id.as_bytes(), profile, fallback_out);
+
+            let mut vr_in_id = FixedBuf::<160>::new();
+            let mut vr_in_name = FixedBuf::<160>::new();
+            let mut desk_in_id = FixedBuf::<160>::new();
+            let mut desk_in_name = FixedBuf::<160>::new();
+            resolve_active_endpoints(
+                enumerator,
+                E_CAPTURE,
+                profile,
+                custom_in,
+                &mut vr_in_id,
+                &mut vr_in_name,
+                &mut desk_in_id,
+                &mut desk_in_name,
+            );
+            let fallback_in = if !profile.desktop_record_id.is_empty() {
+                profile.desktop_record_id.as_bytes()
+            } else {
+                desk_in_id.as_bytes()
+            };
+            Self::fix_if_vr(&mut self.capture_console, vr_in_id.as_bytes(), profile, fallback_in);
+            Self::fix_if_vr(&mut self.capture_multimedia, vr_in_id.as_bytes(), profile, fallback_in);
+            Self::fix_if_vr(&mut self.capture_comm, vr_in_id.as_bytes(), profile, fallback_in);
+        }
+    }
+
+    fn fix_if_vr(
+        slot: &mut FixedBuf<160>,
+        active_vr_id: &[u8],
+        profile: &VrAudioProfile,
+        fallback_desktop_id: &[u8],
+    ) {
+        if slot.is_empty()
+            || (!active_vr_id.is_empty() && eq_ignore_ascii_case(slot.as_bytes(), active_vr_id))
+            || profile.matches_vr_name_or_id(b"", slot.as_bytes(), b"")
+        {
+            if !fallback_desktop_id.is_empty() {
+                slot.set_bytes(fallback_desktop_id);
+            }
+        }
+    }
 }
 
 unsafe fn resolve_active_endpoints(
@@ -1485,13 +1557,44 @@ pub fn run_event_driven_vr_session(
             CloseHandle(h_audio_event);
         }
 
-        // If vrmonitor.exe is still shutting down, wait up to 5s on its process handle so vrmonitor's
-        // exit routine doesn't overwrite our restored endpoints.
+        // Wait up to 5s on vrmonitor.exe, AND poll for any remaining vrmonitor.exe process
+        // (up to ~3s) because SteamVR's vrmonitor.exe performs its "[Audio] Audio shutdown!"
+        // only on eConsole + eMultimedia right as it exits, after vrserver.exe has already closed.
         if !h_vrmonitor.is_null() {
             let _ = WaitForSingleObject(h_vrmonitor, 5000);
             CloseHandle(h_vrmonitor);
+        } else {
+            let mut wait_tries = 0u32;
+            while wait_tries < 15 {
+                let (_, vrmon_pid) = find_process_pids();
+                if vrmon_pid == 0 {
+                    break;
+                }
+                let h_mon = OpenProcess(SYNCHRONIZE, 0, vrmon_pid);
+                if !h_mon.is_null() {
+                    let _ = WaitForSingleObject(h_mon, 5000);
+                    CloseHandle(h_mon);
+                    break;
+                }
+                wait_tries += 1;
+            }
         }
         CloseHandle(h_vrserver);
+
+        // Refresh profile from vrmonitor.txt and re-check snapshots so any role that was
+        // still on a VR device when we launched falls back to the non-VR desktop device.
+        if let Some(p) = paths {
+            let refreshed = VrAudioProfile::load(p);
+            if profile.desktop_playback_id.is_empty() && !refreshed.desktop_playback_id.is_empty() {
+                profile.desktop_playback_id.set_bytes(refreshed.desktop_playback_id.as_bytes());
+                profile.desktop_playback_name.set_bytes(refreshed.desktop_playback_name.as_bytes());
+            }
+            if profile.desktop_record_id.is_empty() && !refreshed.desktop_record_id.is_empty() {
+                profile.desktop_record_id.set_bytes(refreshed.desktop_record_id.as_bytes());
+                profile.desktop_record_name.set_bytes(refreshed.desktop_record_name.as_bytes());
+            }
+        }
+        snapshots.sanitize_against_vr(enumerator, &profile, custom_out, custom_in);
 
         // Restore each role (eConsole, eMultimedia, eCommunications) to its own pre-VR endpoint
         snapshots.restore();
