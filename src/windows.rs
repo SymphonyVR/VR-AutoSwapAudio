@@ -270,9 +270,13 @@ unsafe extern "C" {
 /// Runs a controlled 5-stage memory isolation benchmark (`--bench-stage 1..5`) so each stage's
 /// exact Private Commit, Private Working Set, Total Working Set, Threads, and Loaded Modules
 /// can be inspected from outside while blocked on `WaitForSingleObject(..., INFINITE)`.
+/// All stages are strictly read-only with respect to OS default audio endpoints.
 pub fn run_isolation_benchmark_stage(stage: u8) {
     unsafe {
         let h_event = CreateEventW(null_mut(), 0, 0, null());
+        if h_event.is_null() {
+            return;
+        }
         match stage {
             1 => {
                 // Stage 1: Bare process (mainCRTStartup + CreateEventW + WaitForSingleObject, zero COM/Audio)
@@ -303,9 +307,10 @@ pub fn run_isolation_benchmark_stage(stage: u8) {
                 let _ = WaitForSingleObject(h_event, INFINITE);
             }
             _ => {
-                // Stage 5: Full implementation (SteamVR discovery + RoleSnapshots + IMMNotificationClient + sync_vr_endpoints)
+                // Stage 5: Read-only full initialization (SteamVR discovery + RoleSnapshots + PolicyConfig instantiation
+                // + IMMNotificationClient + CoFreeUnusedLibrariesEx) without mutating any OS default endpoints.
                 let paths = SteamVrPaths::discover();
-                let mut profile = if let Some(ref p) = paths {
+                let profile = if let Some(ref p) = paths {
                     VrAudioProfile::load(p)
                 } else {
                     VrAudioProfile::new()
@@ -314,6 +319,12 @@ pub fn run_isolation_benchmark_stage(stage: u8) {
                 if !enumerator.is_null() {
                     let mut snapshots = RoleSnapshots::new();
                     snapshots.capture_initial(enumerator, &profile, b"", b"");
+                    // Instantiate and release IPolicyConfig to exercise the exact COM server lifecycle read-only
+                    let policy = create_policy_config();
+                    if !policy.is_null() {
+                        let pvtbl = &*(*policy).lpVtbl;
+                        (pvtbl.Release)(policy as *mut c_void);
+                    }
                     G_AUDIO_EVENT.store(h_event, Ordering::Relaxed);
                     let vtbl = &*(*enumerator).lpVtbl;
                     let client_ptr: *mut IMMNotificationClient = &raw mut NOTIFICATION_CLIENT;
@@ -321,7 +332,6 @@ pub fn run_isolation_benchmark_stage(stage: u8) {
                         enumerator as *mut c_void,
                         client_ptr,
                     );
-                    sync_vr_endpoints(enumerator, paths.as_ref(), &mut profile, b"", b"");
                     CoFreeUnusedLibrariesEx(0, 0);
                 }
                 let h_wait = CreateEventW(null_mut(), 0, 0, null());
@@ -521,6 +531,10 @@ unsafe extern "system" fn notif_on_device_removed(
     _this: *mut IMMNotificationClient,
     _pwstrDeviceId: *const u16,
 ) -> HRESULT {
+    let ev = G_AUDIO_EVENT.load(Ordering::Relaxed);
+    if !ev.is_null() {
+        unsafe { SetEvent(ev) };
+    }
     S_OK
 }
 
@@ -1496,33 +1510,48 @@ pub fn run_event_driven_vr_session(
 
         // Create kernel auto-reset event for IMMNotificationClient callbacks
         let h_audio_event = CreateEventW(null_mut(), 0, 0, null());
-        G_AUDIO_EVENT.store(h_audio_event, Ordering::Relaxed);
-
         let vtbl = &*(*enumerator).lpVtbl;
         let client_ptr: *mut IMMNotificationClient = &raw mut NOTIFICATION_CLIENT;
-        let _ = (vtbl.RegisterEndpointNotificationCallback)(enumerator as *mut c_void, client_ptr);
+        let mut notif_registered = false;
+        if !h_audio_event.is_null() {
+            G_AUDIO_EVENT.store(h_audio_event, Ordering::Relaxed);
+            if (vtbl.RegisterEndpointNotificationCallback)(enumerator as *mut c_void, client_ptr) == S_OK {
+                notif_registered = true;
+            } else {
+                println("WARNING: RegisterEndpointNotificationCallback failed; waiting on vrserver exit only.");
+                G_AUDIO_EVENT.store(null_mut(), Ordering::Relaxed);
+            }
+        } else {
+            println("WARNING: CreateEventW failed; waiting on vrserver exit only.");
+        }
 
         // Perform initial sync to VR audio endpoints and unload any unused transient COM DLLs
         sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
         CoFreeUnusedLibrariesEx(0, 0);
 
-        // Purely event-driven kernel wait (0% CPU, zero polling, infinite timeout)
-        let handles = [h_vrserver, h_audio_event];
-        loop {
-            let wait_res = WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE);
-            if wait_res == WAIT_OBJECT_0 {
-                // vrserver.exe has terminated!
-                break;
-            } else if wait_res == WAIT_OBJECT_0 + 1 {
-                // Audio device plugged in or SteamVR changed eConsole/eMultimedia -> sync eCommunications + VR audio
-                sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
-            } else {
-                break;
+        // Purely event-driven kernel wait (negligible idle CPU, zero polling, infinite timeout)
+        if notif_registered && !h_audio_event.is_null() {
+            let handles = [h_vrserver, h_audio_event];
+            loop {
+                let wait_res = WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE);
+                if wait_res == WAIT_OBJECT_0 {
+                    // vrserver.exe has terminated!
+                    break;
+                } else if wait_res == WAIT_OBJECT_0 + 1 {
+                    // Audio device plugged/removed or SteamVR changed eConsole/eMultimedia -> sync eCommunications + VR audio
+                    sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
+                } else {
+                    break;
+                }
             }
+        } else {
+            let _ = WaitForSingleObject(h_vrserver, INFINITE);
         }
 
         // Unregister notification client before restoring
-        let _ = (vtbl.UnregisterEndpointNotificationCallback)(enumerator as *mut c_void, client_ptr);
+        if notif_registered {
+            let _ = (vtbl.UnregisterEndpointNotificationCallback)(enumerator as *mut c_void, client_ptr);
+        }
         G_AUDIO_EVENT.store(null_mut(), Ordering::Relaxed);
         if !h_audio_event.is_null() {
             CloseHandle(h_audio_event);

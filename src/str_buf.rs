@@ -943,5 +943,37 @@ pub fn run_self_tests() -> bool {
         return false;
     }
 
+    // 6. Windows UTF-16 command-line parser tests (quoted paths with spaces, escaped quotes, backslashes, flags)
+    // Input: `"E:\My Path\VR-AutoSwapAudio.exe" --steamvr-launched --output "AC Interface" --input "C:\\Trailing\\\"Quote\"Test"`
+    let raw_cmd_ascii = b"\"E:\\My Path\\VR-AutoSwapAudio.exe\" --steamvr-launched --output \"AC Interface\" --input \"C:\\\\Trailing\\\\\\\"Quote\\\"Test\"";
+    let mut cmd_u16 = [0u16; 160];
+    let mut idx = 0usize;
+    while idx < raw_cmd_ascii.len() {
+        cmd_u16[idx] = raw_cmd_ascii[idx] as u16;
+        idx += 1;
+    }
+    let mut parsed_args = [
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+        FixedBuf::<128>::new(),
+    ];
+    let argc = parse_windows_cmdline_utf16(&cmd_u16[..raw_cmd_ascii.len()], &mut parsed_args);
+    if argc != 5 {
+        return false;
+    }
+    if parsed_args[0].as_bytes() != b"--steamvr-launched"
+        || parsed_args[1].as_bytes() != b"--output"
+        || parsed_args[2].as_bytes() != b"AC Interface"
+        || parsed_args[3].as_bytes() != b"--input"
+        || parsed_args[4].as_bytes() != b"C:\\\\Trailing\\\"Quote\"Test"
+    {
+        return false;
+    }
+
     true
 }

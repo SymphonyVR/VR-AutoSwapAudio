@@ -559,15 +559,33 @@ fn switch_linux_audio(sink: &[u8], source: &[u8], move_all_streams: bool) {
     }
 }
 
+fn get_pactl_default(cmd: &[u8], out: &mut FixedBuf<160>) {
+    out.clear();
+    let mut buf = [0u8; 256];
+    let n = run_pactl_capture(&[cmd], &mut buf);
+    if n > 0 {
+        let trimmed = trim_ascii(&buf[..n]);
+        if !trimmed.is_empty() && !contains_ignore_ascii_case(trimmed, b"Failure") {
+            out.set_bytes(trimmed);
+        }
+    }
+}
+
 fn find_pactl_devices(
     kind: &[u8],
     profile: &VrAudioProfile,
     custom_pat: &[u8],
+    preferred_desk_name: &[u8],
     vr_name_out: &mut FixedBuf<160>,
     vr_desc_out: &mut FixedBuf<160>,
     desk_name_out: &mut FixedBuf<160>,
     desk_desc_out: &mut FixedBuf<160>,
 ) {
+    vr_name_out.clear();
+    vr_desc_out.clear();
+    desk_name_out.clear();
+    desk_desc_out.clear();
+
     with_scratch_buffer(32768, |buf| {
         let n = run_pactl_capture(&[b"list", kind], buf);
         if n == 0 {
@@ -576,6 +594,8 @@ fn find_pactl_devices(
         let text = &buf[..n];
         let mut cur_name = FixedBuf::<160>::new();
         let mut cur_desc = FixedBuf::<160>::new();
+        let mut fallback_desk_name = FixedBuf::<160>::new();
+        let mut fallback_desk_desc = FixedBuf::<160>::new();
 
         let mut line_start = 0;
         while line_start < text.len() {
@@ -607,14 +627,39 @@ fn find_pactl_devices(
                             vr_name_out.set_bytes(cur_name.as_bytes());
                             vr_desc_out.set_bytes(cur_desc.as_bytes());
                         }
-                    } else if desk_name_out.is_empty() {
-                        desk_name_out.set_bytes(cur_name.as_bytes());
-                        desk_desc_out.set_bytes(cur_desc.as_bytes());
+                    } else {
+                        // Prefer the user's snapshotted default device if it is a non-VR endpoint
+                        if !preferred_desk_name.is_empty()
+                            && eq_ignore_ascii_case(cur_name.as_bytes(), preferred_desk_name)
+                        {
+                            desk_name_out.set_bytes(cur_name.as_bytes());
+                            desk_desc_out.set_bytes(cur_desc.as_bytes());
+                        }
+                        if fallback_desk_name.is_empty() {
+                            fallback_desk_name.set_bytes(cur_name.as_bytes());
+                            fallback_desk_desc.set_bytes(cur_desc.as_bytes());
+                        }
                     }
                 }
             }
         }
+
+        if desk_name_out.is_empty() && !fallback_desk_name.is_empty() {
+            desk_name_out.set_bytes(fallback_desk_name.as_bytes());
+            desk_desc_out.set_bytes(fallback_desk_desc.as_bytes());
+        }
     });
+}
+
+fn is_relevant_pactl_subscription_line(line: &[u8]) -> bool {
+    let is_event_kind = contains_ignore_ascii_case(line, b"'new'")
+        || contains_ignore_ascii_case(line, b"'change'")
+        || contains_ignore_ascii_case(line, b"'remove'");
+    let is_target_type = contains_ignore_ascii_case(line, b"on sink")
+        || contains_ignore_ascii_case(line, b"on source")
+        || contains_ignore_ascii_case(line, b"on server")
+        || contains_ignore_ascii_case(line, b"on card");
+    is_event_kind && is_target_type
 }
 
 pub fn print_status(
@@ -640,6 +685,11 @@ pub fn print_status(
         println(line.as_str());
     }
 
+    let mut cur_def_sink = FixedBuf::<160>::new();
+    let mut cur_def_src = FixedBuf::<160>::new();
+    get_pactl_default(b"get-default-sink", &mut cur_def_sink);
+    get_pactl_default(b"get-default-source", &mut cur_def_src);
+
     let mut vr_sink = FixedBuf::<160>::new();
     let mut vr_sink_desc = FixedBuf::<160>::new();
     let mut desk_sink = FixedBuf::<160>::new();
@@ -648,6 +698,7 @@ pub fn print_status(
         b"sinks",
         profile,
         custom_out,
+        cur_def_sink.as_bytes(),
         &mut vr_sink,
         &mut vr_sink_desc,
         &mut desk_sink,
@@ -662,12 +713,19 @@ pub fn print_status(
         b"sources",
         profile,
         custom_in,
+        cur_def_src.as_bytes(),
         &mut vr_src,
         &mut vr_src_desc,
         &mut desk_src,
         &mut desk_src_desc,
     );
 
+    line.clear();
+    let _ = write!(line, "Default Sink   : {}", cur_def_sink.as_str());
+    println(line.as_str());
+    line.clear();
+    let _ = write!(line, "Default Source : {}", cur_def_src.as_str());
+    println(line.as_str());
     line.clear();
     let _ = write!(line, "VR Sink        : {} [{}]", vr_sink_desc.as_str(), vr_sink.as_str());
     println(line.as_str());
@@ -682,7 +740,7 @@ pub fn print_status(
     println(line.as_str());
 }
 
-/// 100% Event-Driven Linux VR Audio Session using `pidfd_open(vrserver_pid)` + `pactl subscribe` + `poll(-1)`.
+/// Event-Driven Linux VR Audio Session using `pidfd_open(vrserver_pid)` + `pactl subscribe` + `poll(-1)`.
 pub fn run_event_driven_vr_session(
     _paths: Option<&SteamVrPaths>,
     profile: VrAudioProfile,
@@ -699,8 +757,20 @@ pub fn run_event_driven_vr_session(
     unsafe {
         let pidfd = syscall(SYS_PIDFD_OPEN, vrserver_pid as c_long, 0 as c_long) as c_int;
         if pidfd < 0 {
-            println("ERROR: pidfd_open failed for vrserver.");
+            println("ERROR: pidfd_open failed for vrserver (requires Linux kernel 5.3+).");
             return;
+        }
+
+        // Snapshot the user's actual pre-VR default sink and source via `pactl get-default-sink` / `get-default-source`
+        let mut snap_sink = FixedBuf::<160>::new();
+        let mut snap_src = FixedBuf::<160>::new();
+        get_pactl_default(b"get-default-sink", &mut snap_sink);
+        get_pactl_default(b"get-default-source", &mut snap_src);
+        if profile.desktop_playback_id.as_bytes().len() > 0 && snap_sink.is_empty() {
+            snap_sink.set_bytes(profile.desktop_playback_id.as_bytes());
+        }
+        if profile.desktop_record_id.as_bytes().len() > 0 && snap_src.is_empty() {
+            snap_src.set_bytes(profile.desktop_record_id.as_bytes());
         }
 
         let mut vr_sink = FixedBuf::<160>::new();
@@ -711,6 +781,7 @@ pub fn run_event_driven_vr_session(
             b"sinks",
             &profile,
             custom_out,
+            snap_sink.as_bytes(),
             &mut vr_sink,
             &mut vr_sink_desc,
             &mut desk_sink,
@@ -725,11 +796,20 @@ pub fn run_event_driven_vr_session(
             b"sources",
             &profile,
             custom_in,
+            snap_src.as_bytes(),
             &mut vr_src,
             &mut vr_src_desc,
             &mut desk_src,
             &mut desk_src_desc,
         );
+
+        // Lock in the resolved non-VR desktop default names for restoration
+        if !desk_sink.is_empty() {
+            snap_sink.set_bytes(desk_sink.as_bytes());
+        }
+        if !desk_src.is_empty() {
+            snap_src.set_bytes(desk_src.as_bytes());
+        }
 
         // Initial switch to VR audio + move Discord streams
         switch_linux_audio(vr_sink.as_bytes(), vr_src.as_bytes(), move_all_streams);
@@ -767,8 +847,10 @@ pub fn run_event_driven_vr_session(
         let mut nfds: u64 = if pfd[0] >= 0 { 2 } else { 1 };
 
         let mut ev_buf = [0u8; 512];
+        let mut line_accum = FixedBuf::<512>::new();
+
         loop {
-            let rc = poll(fds.as_mut_ptr(), nfds, -1); // Infinite wait (-1), 0% CPU
+            let rc = poll(fds.as_mut_ptr(), nfds, -1); // Infinite wait (-1)
             if rc <= 0 {
                 break;
             }
@@ -781,28 +863,42 @@ pub fn run_event_driven_vr_session(
                 if (fds[1].revents & POLLIN) != 0 {
                     let n = read(pfd[0], ev_buf.as_mut_ptr() as *mut c_void, ev_buf.len());
                     if n > 0 {
-                        let ev = &ev_buf[..n as usize];
-                        if find_subslice(ev, b"'new'").is_some() {
-                            if vr_sink.is_empty() || vr_src.is_empty() {
-                                find_pactl_devices(
-                                    b"sinks",
-                                    &profile,
-                                    custom_out,
-                                    &mut vr_sink,
-                                    &mut vr_sink_desc,
-                                    &mut desk_sink,
-                                    &mut desk_sink_desc,
-                                );
-                                find_pactl_devices(
-                                    b"sources",
-                                    &profile,
-                                    custom_in,
-                                    &mut vr_src,
-                                    &mut vr_src_desc,
-                                    &mut desk_src,
-                                    &mut desk_src_desc,
-                                );
+                        let mut should_reconcile = false;
+                        let mut idx = 0usize;
+                        let n_usize = n as usize;
+                        while idx < n_usize {
+                            let b = ev_buf[idx];
+                            if b == b'\n' {
+                                if is_relevant_pactl_subscription_line(line_accum.as_bytes()) {
+                                    should_reconcile = true;
+                                }
+                                line_accum.clear();
+                            } else {
+                                line_accum.push_byte(b);
                             }
+                            idx += 1;
+                        }
+                        if should_reconcile {
+                            find_pactl_devices(
+                                b"sinks",
+                                &profile,
+                                custom_out,
+                                snap_sink.as_bytes(),
+                                &mut vr_sink,
+                                &mut vr_sink_desc,
+                                &mut desk_sink,
+                                &mut desk_sink_desc,
+                            );
+                            find_pactl_devices(
+                                b"sources",
+                                &profile,
+                                custom_in,
+                                snap_src.as_bytes(),
+                                &mut vr_src,
+                                &mut vr_src_desc,
+                                &mut desk_src,
+                                &mut desk_src_desc,
+                            );
                             switch_linux_audio(
                                 vr_sink.as_bytes(),
                                 vr_src.as_bytes(),
@@ -834,6 +930,29 @@ pub fn run_event_driven_vr_session(
         }
         let _ = close(pidfd);
 
+        // Re-enumerate on shutdown to verify the snapshotted desktop sink/source is still present,
+        // falling back to another non-VR device if it was unplugged during the session.
+        find_pactl_devices(
+            b"sinks",
+            &profile,
+            custom_out,
+            snap_sink.as_bytes(),
+            &mut vr_sink,
+            &mut vr_sink_desc,
+            &mut desk_sink,
+            &mut desk_sink_desc,
+        );
+        find_pactl_devices(
+            b"sources",
+            &profile,
+            custom_in,
+            snap_src.as_bytes(),
+            &mut vr_src,
+            &mut vr_src_desc,
+            &mut desk_src,
+            &mut desk_src_desc,
+        );
+
         // Restore desktop default sink/source and move Discord streams back
         switch_linux_audio(desk_sink.as_bytes(), desk_src.as_bytes(), move_all_streams);
     }
@@ -845,6 +964,11 @@ pub fn ensure_desktop_audio(
     custom_in: &[u8],
     move_all_streams: bool,
 ) {
+    let mut cur_def_sink = FixedBuf::<160>::new();
+    let mut cur_def_src = FixedBuf::<160>::new();
+    get_pactl_default(b"get-default-sink", &mut cur_def_sink);
+    get_pactl_default(b"get-default-source", &mut cur_def_src);
+
     let mut vr_sink = FixedBuf::<160>::new();
     let mut vr_sink_desc = FixedBuf::<160>::new();
     let mut desk_sink = FixedBuf::<160>::new();
@@ -853,6 +977,7 @@ pub fn ensure_desktop_audio(
         b"sinks",
         profile,
         custom_out,
+        cur_def_sink.as_bytes(),
         &mut vr_sink,
         &mut vr_sink_desc,
         &mut desk_sink,
@@ -867,11 +992,24 @@ pub fn ensure_desktop_audio(
         b"sources",
         profile,
         custom_in,
+        cur_def_src.as_bytes(),
         &mut vr_src,
         &mut vr_src_desc,
         &mut desk_src,
         &mut desk_src_desc,
     );
 
-    switch_linux_audio(desk_sink.as_bytes(), desk_src.as_bytes(), move_all_streams);
+    // Only switch sink/source if the current default is empty or stuck on the VR endpoint
+    let target_sink = if !vr_sink.is_empty() && eq_ignore_ascii_case(cur_def_sink.as_bytes(), vr_sink.as_bytes()) {
+        desk_sink.as_bytes()
+    } else {
+        b""
+    };
+    let target_src = if !vr_src.is_empty() && eq_ignore_ascii_case(cur_def_src.as_bytes(), vr_src.as_bytes()) {
+        desk_src.as_bytes()
+    } else {
+        b""
+    };
+
+    switch_linux_audio(target_sink, target_src, move_all_streams);
 }
