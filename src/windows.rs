@@ -240,7 +240,10 @@ unsafe extern "system" {
         bWaitAll: BOOL,
         dwMilliseconds: DWORD,
     ) -> DWORD;
+}
 
+#[link(name = "combase", kind = "raw-dylib")]
+unsafe extern "system" {
     fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: DWORD) -> HRESULT;
     fn CoCreateInstance(
         rclsid: *const GUID,
@@ -253,112 +256,80 @@ unsafe extern "system" {
     fn CoFreeUnusedLibrariesEx(dwUnloadDelay: DWORD, dwReserved: DWORD);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    let d = dest as *mut u8;
-    let s = src as *const u8;
-    let mut i = 0;
-    unsafe {
-        while i < n {
-            *d.add(i) = *s.add(i);
-            i += 1;
-        }
-    }
-    dest
+#[link(name = "ntdll", kind = "raw-dylib")]
+#[allow(dead_code)]
+unsafe extern "C" {
+    pub fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    pub fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    pub fn memset(s: *mut c_void, c: i32, n: usize) -> *mut c_void;
+    pub fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> i32;
+    pub fn strlen(s: *const i8) -> usize;
+    pub fn __chkstk();
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    let d = dest as *mut u8;
-    let s = src as *const u8;
+/// Runs a controlled 5-stage memory isolation benchmark (`--bench-stage 1..5`) so each stage's
+/// exact Private Commit, Private Working Set, Total Working Set, Threads, and Loaded Modules
+/// can be inspected from outside while blocked on `WaitForSingleObject(..., INFINITE)`.
+pub fn run_isolation_benchmark_stage(stage: u8) {
     unsafe {
-        if (d as usize) < (s as usize) {
-            let mut i = 0;
-            while i < n {
-                *d.add(i) = *s.add(i);
-                i += 1;
+        let h_event = CreateEventW(null_mut(), 0, 0, null());
+        match stage {
+            1 => {
+                // Stage 1: Bare process (mainCRTStartup + CreateEventW + WaitForSingleObject, zero COM/Audio)
+                let _ = WaitForSingleObject(h_event, INFINITE);
             }
-        } else if (d as usize) > (s as usize) {
-            let mut i = n;
-            while i > 0 {
-                i -= 1;
-                *d.add(i) = *s.add(i);
+            2 => {
+                // Stage 2: Add COM initialization only (CoInitializeEx)
+                let _ = CoInitializeEx(null_mut(), COINIT_MULTITHREADED);
+                let _ = WaitForSingleObject(h_event, INFINITE);
+            }
+            3 => {
+                // Stage 3: Add IMMDeviceEnumerator creation and retention
+                let _enum = create_device_enumerator();
+                let _ = WaitForSingleObject(h_event, INFINITE);
+            }
+            4 => {
+                // Stage 4: Add IMMNotificationClient registration and wait on event
+                let enumerator = create_device_enumerator();
+                if !enumerator.is_null() {
+                    G_AUDIO_EVENT.store(h_event, Ordering::Relaxed);
+                    let vtbl = &*(*enumerator).lpVtbl;
+                    let client_ptr: *mut IMMNotificationClient = &raw mut NOTIFICATION_CLIENT;
+                    let _ = (vtbl.RegisterEndpointNotificationCallback)(
+                        enumerator as *mut c_void,
+                        client_ptr,
+                    );
+                }
+                let _ = WaitForSingleObject(h_event, INFINITE);
+            }
+            _ => {
+                // Stage 5: Full implementation (SteamVR discovery + RoleSnapshots + IMMNotificationClient + sync_vr_endpoints)
+                let paths = SteamVrPaths::discover();
+                let mut profile = if let Some(ref p) = paths {
+                    VrAudioProfile::load(p)
+                } else {
+                    VrAudioProfile::new()
+                };
+                let enumerator = create_device_enumerator();
+                if !enumerator.is_null() {
+                    let mut snapshots = RoleSnapshots::new();
+                    snapshots.capture_initial(enumerator, &profile, b"", b"");
+                    G_AUDIO_EVENT.store(h_event, Ordering::Relaxed);
+                    let vtbl = &*(*enumerator).lpVtbl;
+                    let client_ptr: *mut IMMNotificationClient = &raw mut NOTIFICATION_CLIENT;
+                    let _ = (vtbl.RegisterEndpointNotificationCallback)(
+                        enumerator as *mut c_void,
+                        client_ptr,
+                    );
+                    sync_vr_endpoints(enumerator, paths.as_ref(), &mut profile, b"", b"");
+                    CoFreeUnusedLibrariesEx(0, 0);
+                }
+                let h_wait = CreateEventW(null_mut(), 0, 0, null());
+                let _ = WaitForSingleObject(h_wait, INFINITE);
             }
         }
     }
-    dest
 }
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(s: *mut c_void, c: i32, n: usize) -> *mut c_void {
-    let p = s as *mut u8;
-    let b = c as u8;
-    let mut i = 0;
-    unsafe {
-        while i < n {
-            *p.add(i) = b;
-            i += 1;
-        }
-    }
-    s
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> i32 {
-    let p1 = s1 as *const u8;
-    let p2 = s2 as *const u8;
-    let mut i = 0;
-    unsafe {
-        while i < n {
-            let a = *p1.add(i);
-            let b = *p2.add(i);
-            if a != b {
-                return (a as i32) - (b as i32);
-            }
-            i += 1;
-        }
-    }
-    0
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn strlen(s: *const i8) -> usize {
-    let p = s as *const u8;
-    let mut i = 0;
-    unsafe {
-        while *p.add(i) != 0 {
-            i += 1;
-        }
-    }
-    i
-}
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".global __chkstk",
-    "__chkstk:",
-    "sub rsp, 16",
-    "mov [rsp], r10",
-    "mov [rsp + 8], r11",
-    "xor r11, r11",
-    "lea r10, [rsp + 24]",
-    "sub r10, rax",
-    "cmovb r10, r11",
-    "mov r11, gs:[0x10]",
-    "cmp r10, r11",
-    "jae 3f",
-    "and r10w, 0xF000",
-    "2:",
-    "lea r11, [r11 - 0x1000]",
-    "test byte ptr [r11], 0",
-    "cmp r10, r11",
-    "jne 2b",
-    "3:",
-    "mov r10, [rsp]",
-    "mov r11, [rsp + 8]",
-    "add rsp, 16",
-    "ret"
-);
 
 /// Allocates temporary scratch pages directly from the OS via `VirtualAlloc` and immediately
 /// releases them back to the kernel (`MEM_RELEASE`) on return, avoiding permanently committed stack pages.

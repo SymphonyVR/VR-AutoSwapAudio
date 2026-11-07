@@ -4,7 +4,6 @@ rustflags = [
     "-C", "link-arg=/ENTRY:mainCRTStartup",
     "-C", "link-arg=/NODEFAULTLIB",
     "-C", "link-arg=kernel32.lib",
-    "-C", "link-arg=onecoreuap.lib",
 ]
 
 [target.'cfg(target_os = "linux")']

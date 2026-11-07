@@ -422,16 +422,36 @@ pub fn json_extract_first_array_string(json: &[u8], key: &[u8], out: &mut [u8]) 
     0
 }
 
-/// Locates the `"manifest_paths"` array `[` and matching `]` in `json` structurally
-/// (respecting JSON string literals and escapes).
+/// Locates the top-level `"manifest_paths"` array `[` and matching `]` in `json` structurally
+/// (validating top-level `{...}` object structure, string literals, escapes, and depth).
 fn find_manifest_paths_array_bounds(json: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
+    let mut obj_depth = 0usize;
+    let mut arr_depth = 0usize;
+    let mut saw_root_open = false;
+    let mut saw_non_ws_outside_root = false;
+    let mut found_bounds: Option<(usize, usize)> = None;
+
     while i < json.len() {
-        if json[i] == b'"' {
+        let b = json[i];
+        if !saw_root_open
+            && b != b'{'
+            && b != b' '
+            && b != b'\t'
+            && b != b'\r'
+            && b != b'\n'
+        {
+            saw_non_ws_outside_root = true;
+            break;
+        }
+        if b == b'"' {
             let str_start = i + 1;
             i += 1;
             while i < json.len() {
                 if json[i] == b'\\' {
+                    if i + 1 >= json.len() {
+                        return None; // Dangling escape at EOF
+                    }
                     i += 2;
                     continue;
                 }
@@ -440,17 +460,22 @@ fn find_manifest_paths_array_bounds(json: &[u8]) -> Option<(usize, usize)> {
                 }
                 i += 1;
             }
+            if i >= json.len() {
+                return None; // Unterminated string literal
+            }
             let str_end = i;
             i += 1;
 
-            if &json[str_start..str_end] == b"manifest_paths" {
-                while i < json.len()
-                    && (json[i] == b' ' || json[i] == b'\t' || json[i] == b'\r' || json[i] == b'\n')
+            // Only match `"manifest_paths"` when it is a top-level key of the root JSON object
+            if obj_depth == 1 && arr_depth == 0 && &json[str_start..str_end] == b"manifest_paths" {
+                let mut j = i;
+                while j < json.len()
+                    && (json[j] == b' ' || json[j] == b'\t' || json[j] == b'\r' || json[j] == b'\n')
                 {
-                    i += 1;
+                    j += 1;
                 }
-                if i < json.len() && json[i] == b':' {
-                    i += 1;
+                if j < json.len() && json[j] == b':' {
+                    i = j + 1;
                     while i < json.len()
                         && (json[i] == b' '
                             || json[i] == b'\t'
@@ -459,42 +484,168 @@ fn find_manifest_paths_array_bounds(json: &[u8]) -> Option<(usize, usize)> {
                     {
                         i += 1;
                     }
-                    if i < json.len() && json[i] == b'[' {
-                        let open_bracket = i;
-                        i += 1;
-                        let mut depth = 1usize;
-                        while i < json.len() && depth > 0 {
-                            if json[i] == b'"' {
-                                i += 1;
-                                while i < json.len() {
-                                    if json[i] == b'\\' {
-                                        i += 2;
-                                        continue;
-                                    }
-                                    if json[i] == b'"' {
-                                        break;
-                                    }
-                                    i += 1;
-                                }
-                            } else if json[i] == b'[' {
-                                depth += 1;
-                            } else if json[i] == b']' {
-                                depth -= 1;
-                                if depth == 0 {
-                                    return Some((open_bracket, i));
-                                }
-                            }
+                    if i >= json.len() || json[i] != b'[' {
+                        return None; // `"manifest_paths"` value is not an array
+                    }
+                    let open_bracket = i;
+                    i += 1;
+                    let mut depth = 1usize;
+                    while i < json.len() && depth > 0 {
+                        if json[i] == b'"' {
                             i += 1;
+                            while i < json.len() {
+                                if json[i] == b'\\' {
+                                    if i + 1 >= json.len() {
+                                        return None;
+                                    }
+                                    i += 2;
+                                    continue;
+                                }
+                                if json[i] == b'"' {
+                                    break;
+                                }
+                                i += 1;
+                            }
+                            if i >= json.len() {
+                                return None; // Unterminated string inside array
+                            }
+                        } else if json[i] == b'[' {
+                            depth += 1;
+                        } else if json[i] == b']' {
+                            depth -= 1;
+                            if depth == 0 {
+                                found_bounds = Some((open_bracket, i));
+                                i += 1;
+                                break;
+                            }
                         }
-                        return None;
+                        i += 1;
+                    }
+                    if depth != 0 {
+                        return None; // Unclosed `[`
                     }
                 }
             }
+        } else if b == b'{' {
+            saw_root_open = true;
+            obj_depth += 1;
+            i += 1;
+        } else if b == b'}' {
+            if obj_depth == 0 {
+                return None; // Unbalanced `}`
+            }
+            obj_depth -= 1;
+            i += 1;
+        } else if b == b'[' {
+            arr_depth += 1;
+            i += 1;
+        } else if b == b']' {
+            if arr_depth == 0 {
+                return None; // Unbalanced `]`
+            }
+            arr_depth -= 1;
+            i += 1;
         } else {
             i += 1;
         }
     }
-    None
+
+    if !saw_root_open || saw_non_ws_outside_root || obj_depth != 0 || arr_depth != 0 {
+        return None;
+    }
+    found_bounds
+}
+
+/// Locates the final closing `}` of a valid top-level JSON object when `"manifest_paths"` is absent,
+/// plus whether the object already contains at least one key-value pair.
+fn find_root_object_insertion_point(json: &[u8]) -> Option<(usize, bool)> {
+    let mut i = 0;
+    let mut obj_depth = 0usize;
+    let mut arr_depth = 0usize;
+    let mut saw_root_open = false;
+    let mut has_top_level_colon = false;
+    let mut root_close_pos = None;
+
+    while i < json.len() {
+        let b = json[i];
+        if !saw_root_open
+            && b != b'{'
+            && b != b' '
+            && b != b'\t'
+            && b != b'\r'
+            && b != b'\n'
+        {
+            return None;
+        }
+        if b == b'"' {
+            let str_start = i + 1;
+            i += 1;
+            while i < json.len() {
+                if json[i] == b'\\' {
+                    if i + 1 >= json.len() {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if json[i] == b'"' {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= json.len() {
+                return None;
+            }
+            let str_end = i;
+            i += 1;
+            // If `"manifest_paths"` key is present (e.g. with an invalid non-array value), reject!
+            if obj_depth == 1 && arr_depth == 0 && &json[str_start..str_end] == b"manifest_paths" {
+                let mut j = i;
+                while j < json.len()
+                    && (json[j] == b' ' || json[j] == b'\t' || json[j] == b'\r' || json[j] == b'\n')
+                {
+                    j += 1;
+                }
+                if j < json.len() && json[j] == b':' {
+                    return None;
+                }
+            }
+        } else if b == b'{' {
+            if !saw_root_open {
+                saw_root_open = true;
+            }
+            obj_depth += 1;
+            i += 1;
+        } else if b == b'}' {
+            if obj_depth == 0 {
+                return None;
+            }
+            obj_depth -= 1;
+            if obj_depth == 0 {
+                root_close_pos = Some(i);
+            }
+            i += 1;
+        } else if b == b'[' {
+            arr_depth += 1;
+            i += 1;
+        } else if b == b']' {
+            if arr_depth == 0 {
+                return None;
+            }
+            arr_depth -= 1;
+            i += 1;
+        } else {
+            if b == b':' && obj_depth == 1 && arr_depth == 0 {
+                has_top_level_colon = true;
+            }
+            i += 1;
+        }
+    }
+
+    if !saw_root_open || obj_depth != 0 || arr_depth != 0 {
+        return None;
+    }
+    root_close_pos.map(|pos| (pos, has_top_level_colon))
 }
 
 fn push_slice_checked(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> bool {
@@ -564,86 +715,233 @@ pub fn update_appconfig_manifest_paths(
         return Some(pos);
     }
 
-    let (open_b, close_b) = find_manifest_paths_array_bounds(existing)?;
+    if let Some((open_b, close_b)) = find_manifest_paths_array_bounds(existing) {
+        // Copy everything up to and including `[`
+        if !push_slice_checked(out, &mut pos, &existing[..=open_b]) {
+            return None;
+        }
 
-    // Copy everything up to and including `[`
-    if !push_slice_checked(out, &mut pos, &existing[..=open_b]) {
-        return None;
-    }
-
-    // Parse all quoted string literals inside `[...]`
-    let inner = &existing[open_b + 1..close_b];
-    let mut count = 0usize;
-    let mut i = 0usize;
-    while i < inner.len() {
-        if inner[i] == b'"' {
-            let lit_start = i;
-            i += 1;
-            while i < inner.len() {
-                if inner[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if inner[i] == b'"' {
-                    break;
-                }
+        // Parse all quoted string literals inside `[...]`
+        let inner = &existing[open_b + 1..close_b];
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < inner.len() {
+            if inner[i] == b'"' {
+                let lit_start = i;
                 i += 1;
-            }
-            if i >= inner.len() {
-                return None; // Unterminated string literal
-            }
-            let lit_end = i + 1; // inclusive of closing quote
-            let raw_literal = &inner[lit_start..lit_end];
-            i = lit_end;
+                while i < inner.len() {
+                    if inner[i] == b'\\' {
+                        if i + 1 >= inner.len() {
+                            return None;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if inner[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= inner.len() {
+                    return None; // Unterminated string literal
+                }
+                let lit_end = i + 1; // inclusive of closing quote
+                let raw_literal = &inner[lit_start..lit_end];
+                i = lit_end;
 
-            // Keep entry unless it matches our manifest filename
-            if !contains_ignore_ascii_case(raw_literal, manifest_filename) {
-                if count > 0 {
-                    if !push_slice_checked(out, &mut pos, b",") {
+                // Keep entry unless it matches our manifest filename
+                if !contains_ignore_ascii_case(raw_literal, manifest_filename) {
+                    if count > 0 {
+                        if !push_slice_checked(out, &mut pos, b",") {
+                            return None;
+                        }
+                    }
+                    if !push_slice_checked(out, &mut pos, b"\n      ") {
                         return None;
                     }
+                    if !push_slice_checked(out, &mut pos, raw_literal) {
+                        return None;
+                    }
+                    count += 1;
                 }
-                if !push_slice_checked(out, &mut pos, b"\n      ") {
-                    return None;
-                }
-                if !push_slice_checked(out, &mut pos, raw_literal) {
-                    return None;
-                }
-                count += 1;
+            } else {
+                i += 1;
             }
-        } else {
-            i += 1;
         }
-    }
 
-    if let Some(p) = add_manifest_path {
+        if let Some(p) = add_manifest_path {
+            if count > 0 {
+                if !push_slice_checked(out, &mut pos, b",") {
+                    return None;
+                }
+            }
+            if !push_slice_checked(out, &mut pos, b"\n      \"") {
+                return None;
+            }
+            if !push_json_escaped_checked(out, &mut pos, p) {
+                return None;
+            }
+            if !push_slice_checked(out, &mut pos, b"\"") {
+                return None;
+            }
+            count += 1;
+        }
+
         if count > 0 {
-            if !push_slice_checked(out, &mut pos, b",") {
+            if !push_slice_checked(out, &mut pos, b"\n   ") {
                 return None;
             }
         }
+
+        // Copy `]` and everything after it verbatim (preserving all other keys in appconfig.json)
+        if !push_slice_checked(out, &mut pos, &existing[close_b..]) {
+            return None;
+        }
+
+        return Some(pos);
+    }
+
+    // Valid JSON object without a `"manifest_paths"` key yet: insert `"manifest_paths"` before closing `}`
+    let (close_brace, has_existing_fields) = find_root_object_insertion_point(existing)?;
+    let mut prefix_end = close_brace;
+    while prefix_end > 0
+        && (existing[prefix_end - 1] == b' '
+            || existing[prefix_end - 1] == b'\t'
+            || existing[prefix_end - 1] == b'\r'
+            || existing[prefix_end - 1] == b'\n')
+    {
+        prefix_end -= 1;
+    }
+
+    if !push_slice_checked(out, &mut pos, &existing[..prefix_end]) {
+        return None;
+    }
+    if has_existing_fields && prefix_end > 0 && existing[prefix_end - 1] != b',' {
+        if !push_slice_checked(out, &mut pos, b",") {
+            return None;
+        }
+    }
+    if !push_slice_checked(out, &mut pos, b"\n   \"manifest_paths\" : [") {
+        return None;
+    }
+    if let Some(p) = add_manifest_path {
         if !push_slice_checked(out, &mut pos, b"\n      \"") {
             return None;
         }
         if !push_json_escaped_checked(out, &mut pos, p) {
             return None;
         }
-        if !push_slice_checked(out, &mut pos, b"\"") {
-            return None;
-        }
-        count += 1;
-    }
-
-    if count > 0 {
-        if !push_slice_checked(out, &mut pos, b"\n   ") {
+        if !push_slice_checked(out, &mut pos, b"\"\n   ") {
             return None;
         }
     }
-
-    // Copy `]` and everything after it verbatim (preserving all other keys in appconfig.json)
-    if !push_slice_checked(out, &mut pos, &existing[close_b..]) {
+    if !push_slice_checked(out, &mut pos, b"]\n") {
+        return None;
+    }
+    if !push_slice_checked(out, &mut pos, &existing[close_brace..]) {
         return None;
     }
 
     Some(pos)
+}
+
+/// Self-test suite verifying `update_appconfig_manifest_paths` and `parse_windows_cmdline_utf16`
+/// against malformed JSON, missing `manifest_paths`, escaped quotes/brackets, and oversized inputs.
+pub fn run_self_tests() -> bool {
+    let mut out = [0u8; 512];
+
+    // 1. Empty input -> creates valid appconfig.json
+    let Some(n1) = update_appconfig_manifest_paths(
+        b"",
+        b"vr-autoswapaudio.vrmanifest",
+        Some(b"C:\\vr\\vr-autoswapaudio.vrmanifest"),
+        &mut out,
+    ) else {
+        return false;
+    };
+    if find_subslice(&out[..n1], b"\"C:\\\\vr\\\\vr-autoswapaudio.vrmanifest\"").is_none() {
+        return false;
+    }
+
+    // 2. Missing `manifest_paths` in an existing JSON object with unrelated fields -> preserves unrelated fields and adds `manifest_paths`
+    let missing_mp = b"{\n   \"other_setting\" : true,\n   \"nested\" : { \"a\" : [1, 2] }\n}\n";
+    let Some(n2) = update_appconfig_manifest_paths(
+        missing_mp,
+        b"vr-autoswapaudio.vrmanifest",
+        Some(b"E:\\vr\\vr-autoswapaudio.vrmanifest"),
+        &mut out,
+    ) else {
+        return false;
+    };
+    if find_subslice(&out[..n2], b"\"other_setting\" : true").is_none()
+        || find_subslice(&out[..n2], b"\"nested\" : { \"a\" : [1, 2] }").is_none()
+        || find_subslice(&out[..n2], b"\"manifest_paths\" : [").is_none()
+    {
+        return false;
+    }
+
+    // 3. Escaped quotes & brackets inside strings + unrelated fields before and after `manifest_paths`
+    let complex_json = br#"{
+   "header" : "val with ] and \"manifest_paths\" : [ \"fake\" ]",
+   "manifest_paths" : [
+      "C:\\Path\\With \"Quote\" and [Bracket]\\app.vrmanifest",
+      "E:\\Old\\vr-autoswapaudio.vrmanifest"
+   ],
+   "footer" : 42
+}"#;
+    let Some(n3) = update_appconfig_manifest_paths(
+        complex_json,
+        b"vr-autoswapaudio.vrmanifest",
+        Some(b"E:\\New\\vr-autoswapaudio.vrmanifest"),
+        &mut out,
+    ) else {
+        return false;
+    };
+    let res3 = &out[..n3];
+    if find_subslice(res3, b"\"header\" : \"val with ]").is_none()
+        || find_subslice(res3, b"\"footer\" : 42").is_none()
+        || find_subslice(res3, b"E:\\\\Old\\\\vr-autoswapaudio.vrmanifest").is_some()
+        || find_subslice(res3, b"E:\\\\New\\\\vr-autoswapaudio.vrmanifest").is_none()
+        || find_subslice(res3, b"[Bracket]\\\\app.vrmanifest").is_none()
+    {
+        return false;
+    }
+
+    // 4. Malformed JSON (unclosed string, unclosed bracket, non-array manifest_paths, truncated file) MUST return None
+    let malformed_cases: &[&[u8]] = &[
+        b"{\"manifest_paths\": [\"unterminated}",
+        b"{\"manifest_paths\": [\"a\"",
+        b"{\"manifest_paths\": 123}",
+        b"{\"manifest_paths\": [\"a\"]} }",
+        b"not json at all",
+    ];
+    let mut k = 0;
+    while k < malformed_cases.len() {
+        if update_appconfig_manifest_paths(
+            malformed_cases[k],
+            b"vr-autoswapaudio.vrmanifest",
+            Some(b"C:\\vr-autoswapaudio.vrmanifest"),
+            &mut out,
+        )
+        .is_some()
+        {
+            return false;
+        }
+        k += 1;
+    }
+
+    // 5. Oversized output buffer check -> returns None instead of truncating
+    let mut tiny_out = [0u8; 20];
+    if update_appconfig_manifest_paths(
+        complex_json,
+        b"vr-autoswapaudio.vrmanifest",
+        Some(b"E:\\New\\vr-autoswapaudio.vrmanifest"),
+        &mut tiny_out,
+    )
+    .is_some()
+    {
+        return false;
+    }
+
+    true
 }

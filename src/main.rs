@@ -108,6 +108,27 @@ fn app_main() -> u32 {
         } else if eq_ignore_ascii_case(a, b"--input") && i + 1 < argc {
             i += 1;
             custom_in.set_bytes(args[i].as_bytes());
+        } else if eq_ignore_ascii_case(a, b"--self-test") {
+            if str_buf::run_self_tests() {
+                platform::println("SELF-TEST PASSED: appconfig.json structural parser & edge cases verified.");
+                return 0;
+            } else {
+                platform::println("SELF-TEST FAILED.");
+                return 1;
+            }
+        } else if eq_ignore_ascii_case(a, b"--bench-stage") && i + 1 < argc {
+            i += 1;
+            let _s = args[i].as_bytes();
+            #[cfg(target_os = "windows")]
+            {
+                let stage = if !_s.is_empty() && _s[0] >= b'1' && _s[0] <= b'5' {
+                    _s[0] - b'0'
+                } else {
+                    1
+                };
+                platform::run_isolation_benchmark_stage(stage);
+            }
+            return 0;
         }
         i += 1;
     }
