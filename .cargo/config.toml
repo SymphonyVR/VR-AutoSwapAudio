@@ -1,0 +1,16 @@
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = [
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE",
+    "-C", "link-arg=/ENTRY:mainCRTStartup",
+    "-C", "link-arg=/NODEFAULTLIB",
+    "-C", "link-arg=kernel32.lib",
+    "-C", "link-arg=ole32.lib",
+    "-C", "link-arg=shell32.lib",
+    "-C", "link-arg=advapi32.lib",
+    "-C", "link-arg=vcruntime.lib",
+]
+
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    "-C", "link-arg=-lc",
+]
