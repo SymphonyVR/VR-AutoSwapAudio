@@ -172,7 +172,6 @@ pub fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Converts a null-terminated or bounded UTF-16 slice into UTF-8 inside `out`.
 /// Returns the number of UTF-8 bytes written.
-#[cfg(target_os = "windows")]
 pub fn utf16_to_utf8(utf16: &[u16], out: &mut [u8]) -> usize {
     let mut len = 0;
     while len < utf16.len() && utf16[len] != 0 {
