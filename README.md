@@ -8,10 +8,9 @@ A tiny (~33 KB), cross-platform (**Windows & Linux `x86_64`**), **`#![no_std]` +
 
 When SteamVR starts (or when a wireless/USB headset like a Pico, Quest, Index, or Vive connects):
 - **Windows**: SteamVR only switches the `eConsole` and `eMultimedia` audio roles, frequently ignoring or failing to restore the **`eCommunications`** role that **Discord** uses for voice chat and microphone input—leaving Discord stuck on your desktop speakers/mic during VR, or stuck on your disconnected VR headset after quitting SteamVR.
-- **Linux**: PipeWire / PulseAudio may not move already-open Discord WebRTC playback (`sink-input`) and capture (`source-output`) streams when the default sink/source changes.
-- **Unpredictable Device Names**: Many VR headsets expose generic USB audio names (e.g., `Altavoces (AC Interface)` and `Capture Input terminal (AC Interface)` on Pico headsets) that don't match the headset's brand name.
+- **Linux**: Changing your default speakers or microphone doesn't necessarily redirect a Discord call that's already in progress. The call may keep using the previous audio device, even after SteamVR changes the system default. VR-AutoSwapAudio moves Discord's active voice playback and microphone streams to the VR headset and back without requiring you to restart the call.
 
-`VR-AutoSwapAudio` addresses all three issues using native OS event notifications rather than background polling loops.
+`VR-AutoSwapAudio` handles these audio transitions using native OS event notifications rather than background polling loops.
 
 ---
 
@@ -21,7 +20,7 @@ When SteamVR starts (or when a wireless/USB headset like a Pico, Quest, Index, o
 - **Event-Driven Architecture (No Polling Loops)**:
   - **Windows (`x86_64-pc-windows-msvc`)**: Uses a COM `IMMNotificationClient` vtable (`OnDefaultDeviceChanged`, `OnDeviceStateChanged`, `OnDeviceAdded`, `OnDeviceRemoved`) combined with kernel handle synchronization (`WaitForMultipleObjects(..., INFINITE)` on `vrserver.exe` and the notification event). Uses negligible idle CPU while waiting, and snapshots/restores `eConsole`, `eMultimedia`, and `eCommunications` roles independently.
   - **Linux (`x86_64-unknown-linux-gnu`, kernel 5.3+)**: Snapshots the user's original default sink/source (`pactl get-default-sink` / `get-default-source`), then uses kernel `pidfd_open` on `vrserver` multiplexed with `pactl subscribe` via `poll(..., -1)` to switch default sinks/sources and move live Discord/WebRTC streams (`pactl move-sink-input` / `pactl move-source-output`, or all streams with `--all-streams`).
-- **SteamVR Configuration & Log Discovery**: Reads `openvrpaths.vrpath`, `steamvr.vrsettings`, and `vrmonitor.txt` to identify the audio endpoints (including hardware `VID/PID` and parenthesized adapter tags) that SteamVR uses for your HMD, plus heuristic fallbacks and manual `--output`/`--input` overrides.
+- **Headset Detection Without Relying on Device Names**: Finds VR speakers and microphones even when their names don't mention the headset brand (for example, generic USB audio devices). Instead of guessing from names alone, it uses SteamVR configuration and logs (`openvrpaths.vrpath`, `steamvr.vrsettings`, `vrmonitor.txt`), audio endpoint IDs, USB `VID/PID` identifiers, and adapter tags when available. It also provides heuristic matching and manual `--output`/`--input` overrides.
 - **`#![no_std]` & Zero Third-Party Rust Dependencies**:
   - Empty `[dependencies]` in `Cargo.toml` (relies only on native OS interfaces: `kernel32.lib` + `raw-dylib` imports from `combase.dll` and `ntdll.dll` on Windows; `libc` syscalls and `pactl` on Linux).
   - Temporary file buffers (`vrmonitor.txt`, `steamvr.vrsettings`, `appconfig.json`) are allocated via `VirtualAlloc` (`mmap` on Linux) and immediately released back to the OS (`VirtualFree(..., MEM_RELEASE)` / `munmap`) before entering the event wait.
