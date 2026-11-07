@@ -199,3 +199,9 @@ SteamVR Profile Desktop Input : Micrófono (2- USB PnP Audio Device) [{0.0.1.000
   [Default] [Discord/Comm] [Desktop] Micrófono (2- USB PnP Audio Device) [{0.0.1.00000000}.{59ca05da-3264-48de-b064-0d950a911b15}]
   [VR-HMD] Capture Input terminal (AC Interface) [{0.0.1.00000000}.{b85356bd-933e-425e-b725-218d077ff131}]
 ```
+
+---
+
+## Credits
+
+Developed by **SymphonyVR**, with AI development assistance from **Gemini 4 Argon (Antigravity)** and **ChatGPT (GPT-6)**.
