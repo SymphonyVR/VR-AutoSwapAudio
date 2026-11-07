@@ -41,15 +41,15 @@ Measured across the 5-stage isolation benchmark (`VR-AutoSwapAudio.exe --bench-s
 | **4** | + Endpoint notifications (`IMMNotificationClient`) | `~776 KB` | `~1,104 KB` | `~7,524 KB` | `5` | `16` |
 | **5** | Full initialization (SteamVR discovery + `RoleSnapshots` + `IPolicyConfig`) | **`~816 KB`** | **`~1,152 KB`** | **`~7,972 KB`** | `5` | `16` |
 
-*(During an active SteamVR session with live endpoint switches, Private Commit typically settles between `1.15 MB` and `1.6 MB` depending on Windows audio driver/COM state, with `~97%` attributable to the baseline Windows process and COM/Core Audio runtime.)*
+*(In the isolation benchmark above, Stages 1–4 account for `776 KB` of the `816 KB` Private Working Set and `1,104 KB` of the `1,152 KB` Private Commit, while Stage 5's application-level discovery and snapshot state adds `~40 KB` Private Working Set / `~48 KB` Private Commit. During an active SteamVR session with live endpoint switches, Private Commit typically settles between `1.15 MB` and `1.6 MB` depending on Windows audio driver and COM runtime state.)*
 
 ### Supported Platforms & Compatibility Status
 
-| Category | Verified / Tested | Notes & Requirements |
+| Category | Status | Notes & Requirements |
 | :--- | :--- | :--- |
-| **Windows** | Windows 10 / 11 (`x86_64-pc-windows-msvc`) | Requires MSVC linker (`link.exe`). Uses Windows Core Audio (`MMDevApi.dll` / `combase.dll`). |
-| **Linux** | `x86_64-unknown-linux-gnu` (build & static check verified) | Requires **Linux kernel 5.3+** (`pidfd_open` syscall) and `pactl` (`pipewire-pulse` or `pulseaudio-utils`). |
-| **VR Headsets / Streaming** | **Pico Neo 3** (USB / Pico Link `AC Interface`) | Also includes heuristic/settings matching for Valve Index, HTC Vive, Meta Quest / Link, Virtual Desktop, Steam Link, Bigscreen Beyond, and PSVR2 (use `--output` / `--input` if your streaming driver exposes a custom device name). |
+| **Windows** | Hardware-tested on Windows 10 / 11 (`x86_64-pc-windows-msvc`) | Requires MSVC linker (`link.exe`). Uses Windows Core Audio (`MMDevApi.dll` / `combase.dll`). |
+| **Linux** | Build-verified (`x86_64-unknown-linux-gnu`); end-to-end Linux headset testing pending | Requires **Linux kernel 5.3+** (`pidfd_open` syscall) and `pactl` (`pipewire-pulse` or `pulseaudio-utils`). |
+| **VR Headsets / Streaming** | Hardware-tested on **Pico Neo 3** (USB / Pico Link `AC Interface`) | Includes heuristic/settings matching for Valve Index, HTC Vive, Meta Quest / Link, Virtual Desktop, Steam Link, Bigscreen Beyond, and PSVR2 (use `--output` / `--input` if your streaming driver exposes a custom device name). |
 
 ---
 
@@ -150,13 +150,14 @@ By default, `VR-AutoSwapAudio` uses SteamVR's own HMD audio detection (`steamvr.
 ## Troubleshooting & Diagnostics
 
 - **Headset audio device is not detected (`[Desktop]` shown instead of `[VR-HMD]`)**:
-  Run `VR-AutoSwapAudio --status` while your headset is connected and SteamVR is running. If your headset or wireless streaming driver uses an unrecognized audio endpoint name, either select it once in **SteamVR Settings → Audio** (which writes the override into `steamvr.vrsettings`) or pass `--output "<name>"` / `--input "<name>"` in `vr-autoswapaudio.vrmanifest`.When reporting unexpected device selection in an issue, please include the full output of `VR-AutoSwapAudio --status`.
+  Run `VR-AutoSwapAudio --status` while your headset is connected and SteamVR is running. If your headset or wireless streaming driver uses an unrecognized audio endpoint name, either select it once in **SteamVR Settings → Audio** (which writes the override into `steamvr.vrsettings`) or pass `--output "<name>"` / `--input "<name>"` in `vr-autoswapaudio.vrmanifest`. When reporting unexpected device selection in an issue, please include the full output of `VR-AutoSwapAudio --status`.
 - **Discord does not switch output or microphone**:
   Verify that **Discord → User Settings → Voice & Video → Input Device / Output Device** are both set to **Default** (so Discord follows the Windows `eCommunications` role or the PipeWire/PulseAudio stream move).
 - **Audio stuck on the VR endpoint after a force-kill or crash**:
   Run `VR-AutoSwapAudio` once with SteamVR closed; it will immediately restore any `[Default]` or `[Discord/Comm]` role that is still pointing at a VR device back to your desktop endpoint.
-- **Running built-in self-tests**:
-  Run `VR-AutoSwapAudio --self-test` to verify the structural `appconfig.json` updater and Windows UTF-16 command-line parser against edge cases (escaped quotes, missing keys, malformed JSON, and buffer limits).
+- **Running built-in self-tests & memory isolation stages**:
+  - Run `VR-AutoSwapAudio --self-test` to verify the structural `appconfig.json` updater and Windows UTF-16 command-line parser against edge cases (escaped quotes, missing keys, malformed JSON, and buffer limits).
+  - Run `VR-AutoSwapAudio --bench-stage <1..5>` (Windows) to launch a specific read-only initialization stage for external inspection (e.g. with Sysinternals VMMap or Task Manager). Note that `--bench-stage` deliberately blocks indefinitely on `WaitForSingleObject(..., INFINITE)` so memory can be inspected after startup settles, and must be terminated manually (`Ctrl+C` or `Stop-Process`) when finished.
 
 ---
 
@@ -175,7 +176,7 @@ Options:
   --input <pattern>      Optional custom VR input device substring override
   --all-streams          (Linux) Move all active audio streams, not just Discord
   --self-test            Run built-in parser and configuration self-tests
-  --bench-stage <1..5>   (Windows) Run read-only memory isolation stage 1..5
+  --bench-stage <1..5>   (Windows) Run read-only memory stage 1..5 (waits indefinitely until killed)
   --help, -h             Show this help message
 ```
 
