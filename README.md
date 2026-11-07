@@ -19,13 +19,13 @@ When SteamVR starts (or when a wireless/USB headset like a Pico, Quest, Index, o
 
 - **Zero Background Process When Not in VR**: Registers as a native **SteamVR Auto-Launch Application** (`.vrmanifest`). It does not run at all while SteamVR is closed; SteamVR launches it automatically on startup, and it exits as soon as SteamVR shuts down and your desktop audio is restored.
 - **100% Event-Driven (Zero Polling)**:
-  - **Windows**: Uses a custom COM `IMMNotificationClient` vtable (`OnDefaultDeviceChanged` / `OnDeviceStateChanged`) combined with kernel handle synchronization (`WaitForMultipleObjects(..., INFINITE)` on `vrserver.exe` and `vrmonitor.exe`). Consumes **0% CPU** with zero sleep/polling loops.
-  - **Linux**: Uses kernel `pidfd_open` on `vrserver` multiplexed with `pactl subscribe` via `poll(..., -1)` (infinite kernel wait) to switch default sinks/sources and move live Discord streams (`pactl move-sink-input` / `pactl move-source-output`).
+  - **Windows**: Uses a custom COM `IMMNotificationClient` vtable (`OnDefaultDeviceChanged` / `OnDeviceStateChanged`) combined with kernel handle synchronization (`WaitForMultipleObjects(..., INFINITE)` on `vrserver.exe` and `vrmonitor.exe`). Consumes **0% CPU** with zero sleep/polling loops, and snapshots/restores `eConsole`, `eMultimedia`, and `eCommunications` roles independently.
+  - **Linux**: Uses kernel `pidfd_open` on `vrserver` multiplexed with `pactl subscribe` via `poll(..., -1)` (infinite kernel wait) to switch default sinks/sources and move live Discord/WebRTC streams (`pactl move-sink-input` / `pactl move-source-output`, or all streams with `--all-streams`).
 - **Native SteamVR Device Discovery**: Reads `openvrpaths.vrpath`, `steamvr.vrsettings`, and `vrmonitor.txt` to discover the exact audio endpoints (including hardware `VID/PID` and adapter tags) that SteamVR uses for your HMD, plus your non-VR desktop baseline devices.
 - **`#![no_std]` & Zero Dependencies**:
   - Empty `[dependencies]` in `Cargo.toml`.
-  - Zero heap allocations (uses fixed-size stack buffers).
-  - ~30 KB stripped release executable on Windows.
+  - Links with `/NODEFAULTLIB` on Windows (`kernel32.lib` + `onecoreuap.lib`, without `Shell32.dll` or `ole32.dll` startup imports) and releases temporary file buffers back to the OS via `VirtualAlloc`/`VirtualFree` (`mmap`/`munmap` on Linux).
+  - ~33 KB stripped release executable on Windows (~1.3 MB private commit / ~8.9 MB working set when active in SteamVR).
 
 ---
 
@@ -132,6 +132,7 @@ Options:
   --steamvr-launched     Run event-driven VR audio session (used by SteamVR)
   --output <pattern>     Optional custom VR output device substring override
   --input <pattern>      Optional custom VR input device substring override
+  --all-streams          (Linux) Move all active audio streams, not just Discord
   --help, -h             Show this help message
 ```
 

@@ -65,6 +65,7 @@ fn print_help() {
     platform::println("  --steamvr-launched     Run event-driven VR audio session (used by SteamVR)");
     platform::println("  --output <pattern>     Optional custom VR output device substring override");
     platform::println("  --input <pattern>      Optional custom VR input device substring override");
+    platform::println("  --all-streams          (Linux) Move all active audio streams, not just Discord");
     platform::println("  --help, -h             Show this help message");
 }
 
@@ -84,6 +85,7 @@ fn app_main() -> u32 {
     let mut mode = RunMode::Auto;
     let mut custom_out = FixedBuf::<128>::new();
     let mut custom_in = FixedBuf::<128>::new();
+    let mut move_all_streams = false;
 
     let mut i = 0usize;
     while i < argc {
@@ -98,6 +100,8 @@ fn app_main() -> u32 {
             mode = RunMode::Unregister;
         } else if eq_ignore_ascii_case(a, b"--steamvr-launched") {
             mode = RunMode::SteamVrLaunched;
+        } else if eq_ignore_ascii_case(a, b"--all-streams") {
+            move_all_streams = true;
         } else if eq_ignore_ascii_case(a, b"--output") && i + 1 < argc {
             i += 1;
             custom_out.set_bytes(args[i].as_bytes());
@@ -165,6 +169,7 @@ fn app_main() -> u32 {
                 profile,
                 custom_out.as_bytes(),
                 custom_in.as_bytes(),
+                move_all_streams,
             );
             0
         }
@@ -177,6 +182,7 @@ fn app_main() -> u32 {
                     profile,
                     custom_out.as_bytes(),
                     custom_in.as_bytes(),
+                    move_all_streams,
                 );
                 0
             } else {
@@ -185,6 +191,7 @@ fn app_main() -> u32 {
                     &profile,
                     custom_out.as_bytes(),
                     custom_in.as_bytes(),
+                    move_all_streams,
                 );
                 if let Some(ref p) = paths {
                     if register_autolaunch(p) {

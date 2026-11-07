@@ -2,10 +2,9 @@
 rustflags = [
     "-C", "link-arg=/SUBSYSTEM:CONSOLE",
     "-C", "link-arg=/ENTRY:mainCRTStartup",
+    "-C", "link-arg=/NODEFAULTLIB",
     "-C", "link-arg=kernel32.lib",
-    "-C", "link-arg=ole32.lib",
-    "-C", "link-arg=shell32.lib",
-    "-C", "link-arg=vcruntime.lib",
+    "-C", "link-arg=onecoreuap.lib",
 ]
 
 [target.'cfg(target_os = "linux")']

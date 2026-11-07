@@ -216,6 +216,106 @@ pub fn utf8_to_utf16_null(utf8: &[u8], out: &mut [u16]) -> usize {
     pos
 }
 
+/// Pure-#![no_std] Windows command-line parser (replaces Shell32's `CommandLineToArgvW`).
+/// Skips `argv[0]` (the executable path) and writes up to `out_args.len()` UTF-8 arguments.
+#[cfg(target_os = "windows")]
+pub fn parse_windows_cmdline_utf16(cmd: &[u16], out_args: &mut [FixedBuf<128>; 8]) -> usize {
+    let mut i = 0usize;
+    let n = cmd.len();
+
+    // 1. Skip leading whitespace
+    while i < n && (cmd[i] == b' ' as u16 || cmd[i] == b'\t' as u16) {
+        i += 1;
+    }
+    if i >= n {
+        return 0;
+    }
+
+    // 2. Skip argv[0] (executable name, may be quoted)
+    if cmd[i] == b'"' as u16 {
+        i += 1;
+        while i < n && cmd[i] != b'"' as u16 {
+            i += 1;
+        }
+        if i < n {
+            i += 1;
+        }
+    } else {
+        while i < n && cmd[i] != b' ' as u16 && cmd[i] != b'\t' as u16 {
+            i += 1;
+        }
+    }
+
+    // 3. Parse subsequent arguments following standard Windows C/C++ argv rules
+    let mut argc = 0usize;
+    let mut wtoken = [0u16; 260];
+
+    while i < n && argc < out_args.len() {
+        while i < n && (cmd[i] == b' ' as u16 || cmd[i] == b'\t' as u16) {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+
+        let mut wlen = 0usize;
+        let mut in_quotes = false;
+
+        while i < n {
+            let c = cmd[i];
+            if !in_quotes && (c == b' ' as u16 || c == b'\t' as u16) {
+                break;
+            }
+            if c == b'\\' as u16 {
+                let mut bs_count = 0usize;
+                while i < n && cmd[i] == b'\\' as u16 {
+                    bs_count += 1;
+                    i += 1;
+                }
+                if i < n && cmd[i] == b'"' as u16 {
+                    // 2N backslashes + quote -> N backslashes, toggle quote
+                    // 2N+1 backslashes + quote -> N backslashes + literal quote
+                    let pairs = bs_count / 2;
+                    let mut p = 0;
+                    while p < pairs && wlen < wtoken.len() {
+                        wtoken[wlen] = b'\\' as u16;
+                        wlen += 1;
+                        p += 1;
+                    }
+                    if bs_count % 2 == 0 {
+                        in_quotes = !in_quotes;
+                    } else if wlen < wtoken.len() {
+                        wtoken[wlen] = b'"' as u16;
+                        wlen += 1;
+                    }
+                    i += 1;
+                } else {
+                    let mut p = 0;
+                    while p < bs_count && wlen < wtoken.len() {
+                        wtoken[wlen] = b'\\' as u16;
+                        wlen += 1;
+                        p += 1;
+                    }
+                }
+            } else if c == b'"' as u16 {
+                in_quotes = !in_quotes;
+                i += 1;
+            } else {
+                if wlen < wtoken.len() {
+                    wtoken[wlen] = c;
+                    wlen += 1;
+                }
+                i += 1;
+            }
+        }
+
+        out_args[argc].len = utf16_to_utf8(&wtoken[..wlen], &mut out_args[argc].buf);
+        argc += 1;
+    }
+
+    argc
+}
+
 fn unescape_json_string(raw: &[u8], out: &mut [u8]) -> usize {
     let mut i = 0;
     let mut pos = 0;
@@ -322,3 +422,228 @@ pub fn json_extract_first_array_string(json: &[u8], key: &[u8], out: &mut [u8]) 
     0
 }
 
+/// Locates the `"manifest_paths"` array `[` and matching `]` in `json` structurally
+/// (respecting JSON string literals and escapes).
+fn find_manifest_paths_array_bounds(json: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < json.len() {
+        if json[i] == b'"' {
+            let str_start = i + 1;
+            i += 1;
+            while i < json.len() {
+                if json[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if json[i] == b'"' {
+                    break;
+                }
+                i += 1;
+            }
+            let str_end = i;
+            i += 1;
+
+            if &json[str_start..str_end] == b"manifest_paths" {
+                while i < json.len()
+                    && (json[i] == b' ' || json[i] == b'\t' || json[i] == b'\r' || json[i] == b'\n')
+                {
+                    i += 1;
+                }
+                if i < json.len() && json[i] == b':' {
+                    i += 1;
+                    while i < json.len()
+                        && (json[i] == b' '
+                            || json[i] == b'\t'
+                            || json[i] == b'\r'
+                            || json[i] == b'\n')
+                    {
+                        i += 1;
+                    }
+                    if i < json.len() && json[i] == b'[' {
+                        let open_bracket = i;
+                        i += 1;
+                        let mut depth = 1usize;
+                        while i < json.len() && depth > 0 {
+                            if json[i] == b'"' {
+                                i += 1;
+                                while i < json.len() {
+                                    if json[i] == b'\\' {
+                                        i += 2;
+                                        continue;
+                                    }
+                                    if json[i] == b'"' {
+                                        break;
+                                    }
+                                    i += 1;
+                                }
+                            } else if json[i] == b'[' {
+                                depth += 1;
+                            } else if json[i] == b']' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some((open_bracket, i));
+                                }
+                            }
+                            i += 1;
+                        }
+                        return None;
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn push_slice_checked(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> bool {
+    if *pos + bytes.len() > out.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        out[*pos + i] = bytes[i];
+        i += 1;
+    }
+    *pos += bytes.len();
+    true
+}
+
+fn push_json_escaped_checked(out: &mut [u8], pos: &mut usize, raw: &[u8]) -> bool {
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' {
+            if !push_slice_checked(out, pos, b"\\\\") {
+                return false;
+            }
+        } else if raw[i] == b'"' {
+            if !push_slice_checked(out, pos, b"\\\"") {
+                return false;
+            }
+        } else if !push_slice_checked(out, pos, &[raw[i]]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Structurally updates `"manifest_paths"` in `appconfig.json` while preserving all other
+/// JSON fields before `[` and after `]`.
+/// - Filters out any existing entry matching `manifest_filename`.
+/// - If `add_manifest_path` is `Some(path)`, appends it as the final element of `"manifest_paths"`.
+/// - Returns `Some(written_len)` on success, or `None` if `out` capacity would be exceeded or JSON is malformed.
+pub fn update_appconfig_manifest_paths(
+    existing: &[u8],
+    manifest_filename: &[u8],
+    add_manifest_path: Option<&[u8]>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut pos = 0usize;
+    let trimmed = trim_ascii(existing);
+
+    if trimmed.is_empty() {
+        if !push_slice_checked(out, &mut pos, b"{\n   \"manifest_paths\" : [") {
+            return None;
+        }
+        if let Some(p) = add_manifest_path {
+            if !push_slice_checked(out, &mut pos, b"\n      \"") {
+                return None;
+            }
+            if !push_json_escaped_checked(out, &mut pos, p) {
+                return None;
+            }
+            if !push_slice_checked(out, &mut pos, b"\"\n   ") {
+                return None;
+            }
+        }
+        if !push_slice_checked(out, &mut pos, b"]\n}\n") {
+            return None;
+        }
+        return Some(pos);
+    }
+
+    let (open_b, close_b) = find_manifest_paths_array_bounds(existing)?;
+
+    // Copy everything up to and including `[`
+    if !push_slice_checked(out, &mut pos, &existing[..=open_b]) {
+        return None;
+    }
+
+    // Parse all quoted string literals inside `[...]`
+    let inner = &existing[open_b + 1..close_b];
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < inner.len() {
+        if inner[i] == b'"' {
+            let lit_start = i;
+            i += 1;
+            while i < inner.len() {
+                if inner[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if inner[i] == b'"' {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= inner.len() {
+                return None; // Unterminated string literal
+            }
+            let lit_end = i + 1; // inclusive of closing quote
+            let raw_literal = &inner[lit_start..lit_end];
+            i = lit_end;
+
+            // Keep entry unless it matches our manifest filename
+            if !contains_ignore_ascii_case(raw_literal, manifest_filename) {
+                if count > 0 {
+                    if !push_slice_checked(out, &mut pos, b",") {
+                        return None;
+                    }
+                }
+                if !push_slice_checked(out, &mut pos, b"\n      ") {
+                    return None;
+                }
+                if !push_slice_checked(out, &mut pos, raw_literal) {
+                    return None;
+                }
+                count += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if let Some(p) = add_manifest_path {
+        if count > 0 {
+            if !push_slice_checked(out, &mut pos, b",") {
+                return None;
+            }
+        }
+        if !push_slice_checked(out, &mut pos, b"\n      \"") {
+            return None;
+        }
+        if !push_json_escaped_checked(out, &mut pos, p) {
+            return None;
+        }
+        if !push_slice_checked(out, &mut pos, b"\"") {
+            return None;
+        }
+        count += 1;
+    }
+
+    if count > 0 {
+        if !push_slice_checked(out, &mut pos, b"\n   ") {
+            return None;
+        }
+    }
+
+    // Copy `]` and everything after it verbatim (preserving all other keys in appconfig.json)
+    if !push_slice_checked(out, &mut pos, &existing[close_b..]) {
+        return None;
+    }
+
+    Some(pos)
+}

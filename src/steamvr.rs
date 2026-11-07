@@ -2,6 +2,7 @@ use core::fmt::Write;
 use crate::str_buf::{
     FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case, find_subslice,
     json_extract_first_array_string, json_extract_string_value, rfind_subslice, trim_ascii,
+    update_appconfig_manifest_paths,
 };
 use crate::platform;
 
@@ -28,16 +29,20 @@ impl SteamVrPaths {
         if !platform::get_openvrpaths_file(&mut vrpath_file) {
             return None;
         }
-        let mut file_buf = [0u8; 4096];
-        let n = platform::read_file_bytes(vrpath_file.as_bytes(), &mut file_buf);
-        if n == 0 {
-            return None;
-        }
-        let json = &file_buf[..n];
         let mut paths = Self::new();
-        paths.config_dir.len = json_extract_first_array_string(json, b"config", &mut paths.config_dir.buf);
-        paths.log_dir.len = json_extract_first_array_string(json, b"log", &mut paths.log_dir.buf);
-        paths.runtime_dir.len = json_extract_first_array_string(json, b"runtime", &mut paths.runtime_dir.buf);
+        platform::with_scratch_buffer(8192, |file_buf| {
+            let n = platform::read_file_bytes(vrpath_file.as_bytes(), file_buf);
+            if n == 0 {
+                return;
+            }
+            let json = &file_buf[..n];
+            paths.config_dir.len =
+                json_extract_first_array_string(json, b"config", &mut paths.config_dir.buf);
+            paths.log_dir.len =
+                json_extract_first_array_string(json, b"log", &mut paths.log_dir.buf);
+            paths.runtime_dir.len =
+                json_extract_first_array_string(json, b"runtime", &mut paths.runtime_dir.buf);
+        });
 
         if paths.config_dir.is_empty() {
             None
@@ -98,64 +103,65 @@ impl VrAudioProfile {
         let sep = platform::PATH_SEP;
         let _ = write!(settings_path, "{}{}steamvr.vrsettings", paths.config_dir.as_str(), sep);
 
-        let mut buf = [0u8; 16384];
-        let n = platform::read_file_bytes(settings_path.as_bytes(), &mut buf);
-        if n == 0 {
-            return;
-        }
-        let json = &buf[..n];
+        platform::with_scratch_buffer(32768, |buf| {
+            let n = platform::read_file_bytes(settings_path.as_bytes(), buf);
+            if n == 0 {
+                return;
+            }
+            let json = &buf[..n];
 
-        self.hmd_manufacturer.len =
-            json_extract_string_value(json, b"HMDManufacturer", &mut self.hmd_manufacturer.buf);
-        self.hmd_model.len =
-            json_extract_string_value(json, b"HMDModel", &mut self.hmd_model.buf);
+            self.hmd_manufacturer.len =
+                json_extract_string_value(json, b"HMDManufacturer", &mut self.hmd_manufacturer.buf);
+            self.hmd_model.len =
+                json_extract_string_value(json, b"HMDModel", &mut self.hmd_model.buf);
 
-        if !self.hmd_manufacturer.is_empty() && !self.hmd_model.is_empty() {
-            let mut key = FixedBuf::<256>::new();
+            if !self.hmd_manufacturer.is_empty() && !self.hmd_model.is_empty() {
+                let mut key = FixedBuf::<256>::new();
 
-            // Playback override ID
-            let _ = write!(
-                key,
-                "playbackDeviceOverride_{}_{}",
-                self.hmd_manufacturer.as_str(),
-                self.hmd_model.as_str()
-            );
-            self.vr_playback_id.len =
-                json_extract_string_value(json, key.as_bytes(), &mut self.vr_playback_id.buf);
+                // Playback override ID
+                let _ = write!(
+                    key,
+                    "playbackDeviceOverride_{}_{}",
+                    self.hmd_manufacturer.as_str(),
+                    self.hmd_model.as_str()
+                );
+                self.vr_playback_id.len =
+                    json_extract_string_value(json, key.as_bytes(), &mut self.vr_playback_id.buf);
 
-            // Playback override Name
-            key.clear();
-            let _ = write!(
-                key,
-                "playbackDeviceOverrideName_{}_{}",
-                self.hmd_manufacturer.as_str(),
-                self.hmd_model.as_str()
-            );
-            self.vr_playback_name.len =
-                json_extract_string_value(json, key.as_bytes(), &mut self.vr_playback_name.buf);
+                // Playback override Name
+                key.clear();
+                let _ = write!(
+                    key,
+                    "playbackDeviceOverrideName_{}_{}",
+                    self.hmd_manufacturer.as_str(),
+                    self.hmd_model.as_str()
+                );
+                self.vr_playback_name.len =
+                    json_extract_string_value(json, key.as_bytes(), &mut self.vr_playback_name.buf);
 
-            // Recording override ID
-            key.clear();
-            let _ = write!(
-                key,
-                "recordingDeviceOverride_{}_{}",
-                self.hmd_manufacturer.as_str(),
-                self.hmd_model.as_str()
-            );
-            self.vr_record_id.len =
-                json_extract_string_value(json, key.as_bytes(), &mut self.vr_record_id.buf);
+                // Recording override ID
+                key.clear();
+                let _ = write!(
+                    key,
+                    "recordingDeviceOverride_{}_{}",
+                    self.hmd_manufacturer.as_str(),
+                    self.hmd_model.as_str()
+                );
+                self.vr_record_id.len =
+                    json_extract_string_value(json, key.as_bytes(), &mut self.vr_record_id.buf);
 
-            // Recording override Name
-            key.clear();
-            let _ = write!(
-                key,
-                "recordingDeviceOverrideName_{}_{}",
-                self.hmd_manufacturer.as_str(),
-                self.hmd_model.as_str()
-            );
-            self.vr_record_name.len =
-                json_extract_string_value(json, key.as_bytes(), &mut self.vr_record_name.buf);
-        }
+                // Recording override Name
+                key.clear();
+                let _ = write!(
+                    key,
+                    "recordingDeviceOverrideName_{}_{}",
+                    self.hmd_manufacturer.as_str(),
+                    self.hmd_model.as_str()
+                );
+                self.vr_record_name.len =
+                    json_extract_string_value(json, key.as_bytes(), &mut self.vr_record_name.buf);
+            }
+        });
 
         // Extract parenthesized adapter tag from override name, e.g.
         // "Capture Input terminal (AC Interface)" -> "AC Interface"
@@ -175,72 +181,61 @@ impl VrAudioProfile {
         let sep = platform::PATH_SEP;
         let _ = write!(log_path, "{}{}vrmonitor.txt", paths.log_dir.as_str(), sep);
 
-        // Read up to the last 32 KB of vrmonitor.txt so we get the latest session's audio dump
-        let mut buf = [0u8; 32768];
-        let n = platform::read_file_tail_bytes(log_path.as_bytes(), &mut buf);
-        if n == 0 {
-            return;
-        }
-        let log = &buf[..n];
-
-        // Scan lines in vrmonitor.txt:
-        // Format of device lines logged by vrmonitor:
-        // "\t(Comm)->Altavoces (AC Interface),0,Altavoces,AC Interface,VID_2D40/PID_0016,USB\...,{0.0.0.00000000}.{4736806b-...}"
-        // "\t-->Altavoces (Realtek(R) Audio),0,Altavoces,Realtek(R) Audio,VID_0000/PID_0000,HDAUDIO\...,{0.0.0.00000000}.{d0e38a83-...}"
-        // And transition lines:
-        // "AUDIO: OnDefaultDeviceChanged: flow = eRender, role = eConsole, device = {0.0.0.00000000}.{4736806b-...}"
-        let mut line_start = 0;
-        while line_start < log.len() {
-            let mut line_end = line_start;
-            while line_end < log.len() && log[line_end] != b'\n' {
-                line_end += 1;
+        // Read up to the last 32 KB of vrmonitor.txt using an OS page buffer that is
+        // immediately released (`MEM_RELEASE` / `munmap`) so zero scratch pages stay committed.
+        platform::with_scratch_buffer(32768, |buf| {
+            let n = platform::read_file_tail_bytes(log_path.as_bytes(), buf);
+            if n == 0 {
+                return;
             }
-            let line = trim_ascii(&log[line_start..line_end]);
-            line_start = line_end + 1;
+            let log = &buf[..n];
 
-            // Check if this is an enumerated endpoint line containing ",VID_" and ",{0.0."
-            if let Some(guid_pos) = rfind_subslice(line, b",{0.0.") {
-                let guid = &line[guid_pos + 1..];
-                let is_render = guid.starts_with(b"{0.0.0.");
-                let is_capture = guid.starts_with(b"{0.0.1.");
+            let mut line_start = 0;
+            while line_start < log.len() {
+                let mut line_end = line_start;
+                while line_end < log.len() && log[line_end] != b'\n' {
+                    line_end += 1;
+                }
+                let line = trim_ascii(&log[line_start..line_end]);
+                line_start = line_end + 1;
 
-                // Find the start of the device description after "- \t" or "->"
-                let desc_part = if let Some(arrow) = find_subslice(line, b"->") {
-                    &line[arrow + 2..guid_pos]
-                } else if let Some(tab) = find_subslice(line, b"- \t") {
-                    &line[tab + 3..guid_pos]
-                } else {
-                    &line[..guid_pos]
-                };
+                if let Some(guid_pos) = rfind_subslice(line, b",{0.0.") {
+                    let guid = &line[guid_pos + 1..];
+                    let is_render = guid.starts_with(b"{0.0.0.");
+                    let is_capture = guid.starts_with(b"{0.0.1.");
 
-                // First comma separates full friendly name from ",0,Endpoint,Adapter,VID_..."
-                let friendly_name = if let Some(comma) = find_subslice(desc_part, b",0,") {
-                    &desc_part[..comma]
-                } else {
-                    desc_part
-                };
+                    let desc_part = if let Some(arrow) = find_subslice(line, b"->") {
+                        &line[arrow + 2..guid_pos]
+                    } else if let Some(tab) = find_subslice(line, b"- \t") {
+                        &line[tab + 3..guid_pos]
+                    } else {
+                        &line[..guid_pos]
+                    };
 
-                let is_vr_line = self.matches_vr_name_or_id(friendly_name, guid, desc_part);
-                if is_vr_line {
-                    // Extract VID_xxxx/PID_xxxx if present
-                    if self.vr_vid_pid.is_empty() {
-                        if let Some(vid_idx) = find_subslice(desc_part, b"VID_") {
-                            let rest = &desc_part[vid_idx..];
-                            if let Some(c_idx) = find_subslice(rest, b",") {
-                                self.vr_vid_pid.set_bytes(&rest[..c_idx]);
+                    let friendly_name = if let Some(comma) = find_subslice(desc_part, b",0,") {
+                        &desc_part[..comma]
+                    } else {
+                        desc_part
+                    };
+
+                    let is_vr_line = self.matches_vr_name_or_id(friendly_name, guid, desc_part);
+                    if is_vr_line {
+                        if self.vr_vid_pid.is_empty() {
+                            if let Some(vid_idx) = find_subslice(desc_part, b"VID_") {
+                                let rest = &desc_part[vid_idx..];
+                                if let Some(c_idx) = find_subslice(rest, b",") {
+                                    self.vr_vid_pid.set_bytes(&rest[..c_idx]);
+                                }
                             }
                         }
-                    }
-                    if is_render {
-                        self.vr_playback_id.set_bytes(guid);
-                        self.vr_playback_name.set_bytes(friendly_name);
-                    } else if is_capture {
-                        self.vr_record_id.set_bytes(guid);
-                        self.vr_record_name.set_bytes(friendly_name);
-                    }
-                } else {
-                    // Non-VR device logged in vrmonitor's default audio block -> Desktop baseline!
-                    if is_render {
+                        if is_render {
+                            self.vr_playback_id.set_bytes(guid);
+                            self.vr_playback_name.set_bytes(friendly_name);
+                        } else if is_capture {
+                            self.vr_record_id.set_bytes(guid);
+                            self.vr_record_name.set_bytes(friendly_name);
+                        }
+                    } else if is_render {
                         self.desktop_playback_id.set_bytes(guid);
                         self.desktop_playback_name.set_bytes(friendly_name);
                     } else if is_capture {
@@ -249,7 +244,7 @@ impl VrAudioProfile {
                     }
                 }
             }
-        }
+        });
     }
 
     pub fn matches_vr_name_or_id(&self, friendly_name: &[u8], id: &[u8], extra_info: &[u8]) -> bool {
@@ -280,7 +275,6 @@ impl VrAudioProfile {
         {
             return true;
         }
-        // Standard VR audio adapter identifiers (Pico AC Interface, Valve Index, Vive, Oculus, Virtual Desktop, Steam Streaming)
         const VR_PATTERNS: &[&[u8]] = &[
             b"AC Interface",
             b"Index HMD",
@@ -317,21 +311,7 @@ fn extract_parenthesized_tag(name: &[u8], out: &mut FixedBuf<128>) {
     }
 }
 
-fn append_json_escaped_path(out: &mut FixedBuf<4096>, path: &[u8]) {
-    let mut i = 0;
-    while i < path.len() {
-        if path[i] == b'\\' {
-            out.push_bytes(b"\\\\");
-        } else if path[i] == b'"' {
-            out.push_bytes(b"\\\"");
-        } else {
-            out.push_byte(path[i]);
-        }
-        i += 1;
-    }
-}
-
-/// Generates `vr-autoswapaudio.vrmanifest` next to the executable and registers it in
+/// Generates `vr-autoswapaudio.vrmanifest` next to the executable and registers it atomically in
 /// `<Steam/config>/appconfig.json` and `<Steam/config>/vrappconfig/rust.vr.autoswapaudio.vrappconfig`.
 pub fn register_autolaunch(paths: &SteamVrPaths) -> bool {
     let mut exe_dir = FixedBuf::<512>::new();
@@ -343,18 +323,18 @@ pub fn register_autolaunch(paths: &SteamVrPaths) -> bool {
     let mut manifest_path = FixedBuf::<512>::new();
     let _ = write!(manifest_path, "{}{}{}", exe_dir.as_str(), sep, MANIFEST_FILENAME);
 
-    let mut manifest_json = FixedBuf::<2048>::new();
+    let mut manifest_json = FixedBuf::<1024>::new();
     let _ = write!(
         manifest_json,
         "{{\n    \"source\" : \"builtin\",\n    \"applications\" : [{{\n        \"app_key\" : \"{}\",\n        \"launch_type\" : \"binary\",\n        \"binary_path_windows\" : \"VR-AutoSwapAudio.exe\",\n        \"binary_path_linux\" : \"VR-AutoSwapAudio\",\n        \"arguments\" : \"--steamvr-launched\",\n        \"is_dashboard_overlay\" : true,\n        \"strings\" : {{\n            \"en_us\" : {{\n                \"name\" : \"VR-AutoSwapAudio\",\n                \"description\" : \"Event-driven OS & Discord VR audio auto-switcher\"\n            }}\n        }}\n    }}]\n}}\n",
         APP_KEY
     );
 
-    if !platform::write_file_bytes(manifest_path.as_bytes(), manifest_json.as_bytes()) {
+    if !platform::write_file_atomic(manifest_path.as_bytes(), manifest_json.as_bytes()) {
         return false;
     }
 
-    // 1. Write <config_dir>/vrappconfig/rust.vr.autoswapaudio.vrappconfig
+    // 1. Write <config_dir>/vrappconfig/rust.vr.autoswapaudio.vrappconfig atomically
     let mut vrappconfig_path = FixedBuf::<512>::new();
     let _ = write!(
         vrappconfig_path,
@@ -365,43 +345,13 @@ pub fn register_autolaunch(paths: &SteamVrPaths) -> bool {
         APP_KEY
     );
     let vrappconfig_json = b"{\n   \"autolaunch\" : true,\n   \"last_launch_time\" : \"0\"\n}\n";
-    let _ = platform::write_file_bytes(vrappconfig_path.as_bytes(), vrappconfig_json);
+    let _ = platform::write_file_atomic(vrappconfig_path.as_bytes(), vrappconfig_json);
 
-    // 2. Ensure manifest_path is listed in <config_dir>/appconfig.json
-    let mut appconfig_path = FixedBuf::<512>::new();
-    let _ = write!(appconfig_path, "{}{}appconfig.json", paths.config_dir.as_str(), sep);
-
-    let mut existing_buf = [0u8; 4096];
-    let n = platform::read_file_bytes(appconfig_path.as_bytes(), &mut existing_buf);
-    let existing = &existing_buf[..n];
-
-    if contains_ignore_ascii_case(existing, MANIFEST_FILENAME.as_bytes()) {
-        return true;
-    }
-
-    let mut new_appconfig = FixedBuf::<4096>::new();
-    if let Some(close_bracket) = rfind_subslice(existing, b"]") {
-        // Check if there is already at least one quoted string before `]`
-        let before = trim_ascii(&existing[..close_bracket]);
-        let has_entries = before.ends_with(b"\"");
-        new_appconfig.push_bytes(before);
-        if has_entries {
-            new_appconfig.push_bytes(b",\n      \"");
-        } else {
-            new_appconfig.push_bytes(b"\n      \"");
-        }
-        append_json_escaped_path(&mut new_appconfig, manifest_path.as_bytes());
-        new_appconfig.push_bytes(b"\"\n   ]\n}\n");
-    } else {
-        new_appconfig.push_bytes(b"{\n   \"manifest_paths\" : [\n      \"");
-        append_json_escaped_path(&mut new_appconfig, manifest_path.as_bytes());
-        new_appconfig.push_bytes(b"\"\n   ]\n}\n");
-    }
-
-    platform::write_file_bytes(appconfig_path.as_bytes(), new_appconfig.as_bytes())
+    // 2. Structurally & atomically update <config_dir>/appconfig.json
+    update_appconfig_file(paths, Some(manifest_path.as_bytes()))
 }
 
-/// Removes `vr-autoswapaudio.vrmanifest` from SteamVR's `appconfig.json` and disables autolaunch.
+/// Removes `vr-autoswapaudio.vrmanifest` from SteamVR's `appconfig.json` and disables autolaunch atomically.
 pub fn unregister_autolaunch(paths: &SteamVrPaths) -> bool {
     let sep = platform::PATH_SEP;
     let mut vrappconfig_path = FixedBuf::<512>::new();
@@ -414,51 +364,64 @@ pub fn unregister_autolaunch(paths: &SteamVrPaths) -> bool {
         APP_KEY
     );
     let vrappconfig_json = b"{\n   \"autolaunch\" : false,\n   \"last_launch_time\" : \"0\"\n}\n";
-    let _ = platform::write_file_bytes(vrappconfig_path.as_bytes(), vrappconfig_json);
+    let _ = platform::write_file_atomic(vrappconfig_path.as_bytes(), vrappconfig_json);
 
+    update_appconfig_file(paths, None)
+}
+
+fn update_appconfig_file(paths: &SteamVrPaths, add_manifest_path: Option<&[u8]>) -> bool {
+    let sep = platform::PATH_SEP;
     let mut appconfig_path = FixedBuf::<512>::new();
     let _ = write!(appconfig_path, "{}{}appconfig.json", paths.config_dir.as_str(), sep);
 
-    let mut existing_buf = [0u8; 4096];
-    let n = platform::read_file_bytes(appconfig_path.as_bytes(), &mut existing_buf);
-    if n == 0 {
-        return true;
-    }
-    let existing = &existing_buf[..n];
-    if !contains_ignore_ascii_case(existing, MANIFEST_FILENAME.as_bytes()) {
-        return true;
-    }
+    let mut success = false;
+    // Allocate a 128 KB scratch block (64 KB input + 64 KB output) from the OS and release immediately
+    platform::with_scratch_buffer(131072, |scratch| {
+        let (in_buf, out_buf) = scratch.split_at_mut(65536);
 
-    // Rebuild appconfig.json omitting the line containing MANIFEST_FILENAME
-    let mut out = FixedBuf::<4096>::new();
-    out.push_bytes(b"{\n   \"manifest_paths\" : [\n");
-    let mut first = true;
-    let mut line_start = 0;
-    while line_start < existing.len() {
-        let mut line_end = line_start;
-        while line_end < existing.len() && existing[line_end] != b'\n' {
-            line_end += 1;
-        }
-        let line = trim_ascii(&existing[line_start..line_end]);
-        line_start = line_end + 1;
+        // Read existing appconfig.json with strict size check:
+        // - Returns Some(0) if file does not exist yet
+        // - Returns None if file > 64 KB or read error (refusing to truncate!)
+        let Some(n) = platform::read_file_exact_checked(appconfig_path.as_bytes(), in_buf) else {
+            return;
+        };
+        let existing = &in_buf[..n];
 
-        if line.starts_with(b"\"")
-            && !contains_ignore_ascii_case(line, b"manifest_paths")
-            && !contains_ignore_ascii_case(line, MANIFEST_FILENAME.as_bytes())
-        {
-            let clean = if line.ends_with(b",") {
-                &line[..line.len() - 1]
-            } else {
-                line
-            };
-            if !first {
-                out.push_bytes(b",\n");
+        // If registering and the exact manifest path is already present, no rewrite needed
+        if let Some(target_path) = add_manifest_path {
+            if n > 0 && contains_ignore_ascii_case(existing, MANIFEST_FILENAME.as_bytes()) {
+                // Verify if the existing path already matches target_path
+                let mut check_esc = FixedBuf::<1024>::new();
+                let mut i = 0;
+                while i < target_path.len() {
+                    if target_path[i] == b'\\' {
+                        check_esc.push_bytes(b"\\\\");
+                    } else {
+                        check_esc.push_byte(target_path[i]);
+                    }
+                    i += 1;
+                }
+                if contains_ignore_ascii_case(existing, check_esc.as_bytes()) {
+                    success = true;
+                    return;
+                }
             }
-            out.push_bytes(b"      ");
-            out.push_bytes(clean);
-            first = false;
+        } else if n == 0 || !contains_ignore_ascii_case(existing, MANIFEST_FILENAME.as_bytes()) {
+            success = true;
+            return;
         }
-    }
-    out.push_bytes(b"\n   ]\n}\n");
-    platform::write_file_bytes(appconfig_path.as_bytes(), out.as_bytes())
+
+        let Some(new_len) = update_appconfig_manifest_paths(
+            existing,
+            MANIFEST_FILENAME.as_bytes(),
+            add_manifest_path,
+            out_buf,
+        ) else {
+            return;
+        };
+
+        success = platform::write_file_atomic(appconfig_path.as_bytes(), &out_buf[..new_len]);
+    });
+
+    success
 }

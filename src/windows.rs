@@ -7,7 +7,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::steamvr::{SteamVrPaths, VrAudioProfile};
 use crate::str_buf::{
-    FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case, utf8_to_utf16_null, utf16_to_utf8,
+    FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case, parse_windows_cmdline_utf16,
+    utf8_to_utf16_null, utf16_to_utf8,
 };
 
 pub const PATH_SEP: char = '\\';
@@ -44,6 +45,16 @@ const CREATE_ALWAYS: DWORD = 2;
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 const FILE_END: DWORD = 2;
 const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+const ERROR_FILE_NOT_FOUND: DWORD = 2;
+const ERROR_PATH_NOT_FOUND: DWORD = 3;
+
+const MOVEFILE_REPLACE_EXISTING: DWORD = 0x00000001;
+const MOVEFILE_WRITE_THROUGH: DWORD = 0x00000008;
+
+const MEM_COMMIT: DWORD = 0x00001000;
+const MEM_RESERVE: DWORD = 0x00002000;
+const MEM_RELEASE: DWORD = 0x00008000;
+const PAGE_READWRITE: DWORD = 0x04;
 
 const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
 const SYNCHRONIZE: DWORD = 0x00100000;
@@ -158,6 +169,7 @@ const IID_IPolicyConfigVista: GUID = GUID {
 
 unsafe extern "system" {
     pub fn ExitProcess(uExitCode: u32) -> !;
+    fn GetLastError() -> DWORD;
     fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
     fn WriteFile(
         hFile: HANDLE,
@@ -173,6 +185,8 @@ unsafe extern "system" {
         lpNumberOfBytesRead: *mut DWORD,
         lpOverlapped: *mut c_void,
     ) -> BOOL;
+    fn FlushFileBuffers(hFile: HANDLE) -> BOOL;
+    fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
     fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: DWORD,
@@ -182,6 +196,12 @@ unsafe extern "system" {
         dwFlagsAndAttributes: DWORD,
         hTemplateFile: HANDLE,
     ) -> HANDLE;
+    fn MoveFileExW(
+        lpExistingFileName: *const u16,
+        lpNewFileName: *const u16,
+        dwFlags: DWORD,
+    ) -> BOOL;
+    fn DeleteFileW(lpFileName: *const u16) -> BOOL;
     fn SetFilePointer(
         hFile: HANDLE,
         lDistanceToMove: i32,
@@ -192,8 +212,14 @@ unsafe extern "system" {
     fn GetEnvironmentVariableW(lpName: *const u16, lpBuffer: *mut u16, nSize: DWORD) -> DWORD;
     fn GetModuleFileNameW(hModule: HANDLE, lpFilename: *mut u16, nSize: DWORD) -> DWORD;
     fn GetCommandLineW() -> *const u16;
-    fn CommandLineToArgvW(lpCmdLine: *const u16, pNumArgs: *mut i32) -> *mut *mut u16;
-    fn LocalFree(hMem: *mut c_void) -> *mut c_void;
+
+    fn VirtualAlloc(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flAllocationType: DWORD,
+        flProtect: DWORD,
+    ) -> *mut u8;
+    fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: DWORD) -> BOOL;
 
     fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
     fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
@@ -224,6 +250,131 @@ unsafe extern "system" {
         ppv: *mut *mut c_void,
     ) -> HRESULT;
     fn CoTaskMemFree(pv: *mut c_void);
+    fn CoFreeUnusedLibrariesEx(dwUnloadDelay: DWORD, dwReserved: DWORD);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let s = src as *const u8;
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            *d.add(i) = *s.add(i);
+            i += 1;
+        }
+    }
+    dest
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let s = src as *const u8;
+    unsafe {
+        if (d as usize) < (s as usize) {
+            let mut i = 0;
+            while i < n {
+                *d.add(i) = *s.add(i);
+                i += 1;
+            }
+        } else if (d as usize) > (s as usize) {
+            let mut i = n;
+            while i > 0 {
+                i -= 1;
+                *d.add(i) = *s.add(i);
+            }
+        }
+    }
+    dest
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(s: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    let p = s as *mut u8;
+    let b = c as u8;
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            *p.add(i) = b;
+            i += 1;
+        }
+    }
+    s
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> i32 {
+    let p1 = s1 as *const u8;
+    let p2 = s2 as *const u8;
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            let a = *p1.add(i);
+            let b = *p2.add(i);
+            if a != b {
+                return (a as i32) - (b as i32);
+            }
+            i += 1;
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlen(s: *const i8) -> usize {
+    let p = s as *const u8;
+    let mut i = 0;
+    unsafe {
+        while *p.add(i) != 0 {
+            i += 1;
+        }
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".global __chkstk",
+    "__chkstk:",
+    "sub rsp, 16",
+    "mov [rsp], r10",
+    "mov [rsp + 8], r11",
+    "xor r11, r11",
+    "lea r10, [rsp + 24]",
+    "sub r10, rax",
+    "cmovb r10, r11",
+    "mov r11, gs:[0x10]",
+    "cmp r10, r11",
+    "jae 3f",
+    "and r10w, 0xF000",
+    "2:",
+    "lea r11, [r11 - 0x1000]",
+    "test byte ptr [r11], 0",
+    "cmp r10, r11",
+    "jne 2b",
+    "3:",
+    "mov r10, [rsp]",
+    "mov r11, [rsp + 8]",
+    "add rsp, 16",
+    "ret"
+);
+
+/// Allocates temporary scratch pages directly from the OS via `VirtualAlloc` and immediately
+/// releases them back to the kernel (`MEM_RELEASE`) on return, avoiding permanently committed stack pages.
+pub fn with_scratch_buffer<F: FnOnce(&mut [u8])>(size: usize, f: F) {
+    if size == 0 {
+        return;
+    }
+    unsafe {
+        let ptr = VirtualAlloc(null_mut(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if ptr.is_null() {
+            return;
+        }
+        let slice = core::slice::from_raw_parts_mut(ptr, size);
+        f(slice);
+        let _ = VirtualFree(ptr as *mut c_void, 0, MEM_RELEASE);
+    }
 }
 
 // Raw COM Vtables
@@ -408,7 +559,6 @@ unsafe extern "system" fn notif_on_default_device_changed(
     role: DWORD,
     _pwstrDefaultDeviceId: *const u16,
 ) -> HRESULT {
-    // When SteamVR changes eConsole or eMultimedia, wake up our event loop to sync eCommunications
     if role == E_CONSOLE || role == E_MULTIMEDIA {
         let ev = G_AUDIO_EVENT.load(Ordering::Relaxed);
         if !ev.is_null() {
@@ -465,7 +615,6 @@ pub fn exit(code: u32) -> ! {
 }
 
 pub fn get_openvrpaths_file(out: &mut FixedBuf<512>) -> bool {
-    // %LOCALAPPDATA%\openvr\openvrpaths.vrpath
     let name: [u16; 13] = [
         b'L' as u16, b'O' as u16, b'C' as u16, b'A' as u16, b'L' as u16, b'A' as u16,
         b'P' as u16, b'P' as u16, b'D' as u16, b'A' as u16, b'T' as u16, b'A' as u16, 0,
@@ -532,6 +681,51 @@ pub fn read_file_bytes(path: &[u8], out: &mut [u8]) -> usize {
     }
 }
 
+/// Reads an entire file into `out`, returning:
+/// - `Some(0)` if the file does not exist yet
+/// - `Some(len)` if the entire file fit into `out` and was read completely
+/// - `None` if the file exceeds `out.len()` or an I/O error occurred (preventing truncation)
+pub fn read_file_exact_checked(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut wpath = [0u16; 520];
+    utf8_to_utf16_null(path, &mut wpath);
+    unsafe {
+        let h = CreateFileW(
+            wpath.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
+            let err = GetLastError();
+            if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+                return Some(0);
+            }
+            return None;
+        }
+        let mut file_size = 0i64;
+        if GetFileSizeEx(h, &mut file_size) == 0 || file_size < 0 {
+            CloseHandle(h);
+            return None;
+        }
+        if (file_size as usize) > out.len() {
+            CloseHandle(h);
+            return None;
+        }
+        let expected = file_size as DWORD;
+        let mut read_bytes = 0u32;
+        let ok = ReadFile(h, out.as_mut_ptr(), expected, &mut read_bytes, null_mut());
+        CloseHandle(h);
+        if ok != 0 && read_bytes == expected {
+            Some(read_bytes as usize)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn read_file_tail_bytes(path: &[u8], out: &mut [u8]) -> usize {
     let mut wpath = [0u16; 520];
     utf8_to_utf16_null(path, &mut wpath);
@@ -561,14 +755,22 @@ pub fn read_file_tail_bytes(path: &[u8], out: &mut [u8]) -> usize {
     }
 }
 
-pub fn write_file_bytes(path: &[u8], data: &[u8]) -> bool {
+/// Writes `data` to `<path>.tmp`, flushes buffers to disk, and atomically replaces `<path>` via `MoveFileExW`.
+pub fn write_file_atomic(path: &[u8], data: &[u8]) -> bool {
+    let mut tmp_path = FixedBuf::<520>::new();
+    tmp_path.push_bytes(path);
+    tmp_path.push_str(".tmp");
+
     let mut wpath = [0u16; 520];
+    let mut wtmp = [0u16; 520];
     utf8_to_utf16_null(path, &mut wpath);
+    utf8_to_utf16_null(tmp_path.as_bytes(), &mut wtmp);
+
     unsafe {
         let h = CreateFileW(
-            wpath.as_ptr(),
+            wtmp.as_ptr(),
             GENERIC_WRITE,
-            FILE_SHARE_READ,
+            0,
             null_mut(),
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
@@ -579,39 +781,41 @@ pub fn write_file_bytes(path: &[u8], data: &[u8]) -> bool {
         }
         let mut written = 0u32;
         let ok = WriteFile(h, data.as_ptr(), data.len() as DWORD, &mut written, null_mut());
+        let _ = FlushFileBuffers(h);
         CloseHandle(h);
-        ok != 0 && (written as usize) == data.len()
+
+        if ok == 0 || (written as usize) != data.len() {
+            let _ = DeleteFileW(wtmp.as_ptr());
+            return false;
+        }
+
+        if MoveFileExW(
+            wtmp.as_ptr(),
+            wpath.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        ) != 0
+        {
+            true
+        } else {
+            let _ = DeleteFileW(wtmp.as_ptr());
+            false
+        }
     }
 }
 
+/// Parses command-line arguments directly from `GetCommandLineW()` without loading `Shell32.dll`.
 pub fn parse_cli_args(out_args: &mut [FixedBuf<128>; 8]) -> usize {
     unsafe {
         let cmd = GetCommandLineW();
         if cmd.is_null() {
             return 0;
         }
-        let mut argc = 0i32;
-        let argv = CommandLineToArgvW(cmd, &mut argc);
-        if argv.is_null() {
-            return 0;
+        let mut len = 0usize;
+        while *cmd.add(len) != 0 && len < 4096 {
+            len += 1;
         }
-        let mut count = 0usize;
-        let mut i = 1i32; // Skip argv[0]
-        while i < argc && count < out_args.len() {
-            let wptr = *argv.offset(i as isize);
-            if !wptr.is_null() {
-                let mut wlen = 0usize;
-                while *wptr.add(wlen) != 0 && wlen < 256 {
-                    wlen += 1;
-                }
-                let slice = core::slice::from_raw_parts(wptr, wlen);
-                out_args[count].len = utf16_to_utf8(slice, &mut out_args[count].buf);
-                count += 1;
-            }
-            i += 1;
-        }
-        LocalFree(argv as *mut c_void);
-        count
+        let slice = core::slice::from_raw_parts(cmd, len);
+        parse_windows_cmdline_utf16(slice, out_args)
     }
 }
 
@@ -716,13 +920,7 @@ unsafe fn get_default_endpoint(
     }
 }
 
-unsafe fn set_default_endpoint_all_roles(device_id_utf8: &[u8]) -> bool {
-    if device_id_utf8.is_empty() {
-        return false;
-    }
-    let mut wid = [0u16; 260];
-    utf8_to_utf16_null(device_id_utf8, &mut wid);
-
+unsafe fn create_policy_config() -> *mut IPolicyConfig {
     unsafe {
         let mut policy: *mut IPolicyConfig = null_mut();
         let iids = [IID_IPolicyConfig_Win10, IID_IPolicyConfig_RS, IID_IPolicyConfigVista];
@@ -736,26 +934,61 @@ unsafe fn set_default_endpoint_all_roles(device_id_utf8: &[u8]) -> bool {
                 &mut policy as *mut *mut IPolicyConfig as *mut *mut c_void,
             );
             if hr == S_OK && !policy.is_null() {
-                break;
+                return policy;
             }
             policy = null_mut();
             k += 1;
         }
+        null_mut()
+    }
+}
+
+unsafe fn set_default_endpoint_all_roles(device_id_utf8: &[u8]) -> bool {
+    if device_id_utf8.is_empty() {
+        return false;
+    }
+    let mut wid = [0u16; 260];
+    utf8_to_utf16_null(device_id_utf8, &mut wid);
+
+    unsafe {
+        let policy = create_policy_config();
         if policy.is_null() {
             return false;
         }
-
         let vtbl = &*(*policy).lpVtbl;
-        // Switch all 3 Windows Audio roles:
-        // - eConsole (0): Games & system audio
-        // - eMultimedia (1): Media & general audio
-        // - eCommunications (2): Discord voice & microphone!
         let hr0 = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_CONSOLE);
         let hr1 = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_MULTIMEDIA);
         let hr2 = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_COMMUNICATIONS);
         (vtbl.Release)(policy as *mut c_void);
-
         hr0 == S_OK || hr1 == S_OK || hr2 == S_OK
+    }
+}
+
+unsafe fn set_endpoint_per_role(
+    console_id: &[u8],
+    multimedia_id: &[u8],
+    comm_id: &[u8],
+) {
+    unsafe {
+        let policy = create_policy_config();
+        if policy.is_null() {
+            return;
+        }
+        let vtbl = &*(*policy).lpVtbl;
+        let mut wid = [0u16; 260];
+        if !console_id.is_empty() {
+            utf8_to_utf16_null(console_id, &mut wid);
+            let _ = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_CONSOLE);
+        }
+        if !multimedia_id.is_empty() {
+            utf8_to_utf16_null(multimedia_id, &mut wid);
+            let _ = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_MULTIMEDIA);
+        }
+        if !comm_id.is_empty() {
+            utf8_to_utf16_null(comm_id, &mut wid);
+            let _ = (vtbl.SetDefaultEndpoint)(policy as *mut c_void, wid.as_ptr(), E_COMMUNICATIONS);
+        }
+        (vtbl.Release)(policy as *mut c_void);
     }
 }
 
@@ -778,9 +1011,177 @@ unsafe fn create_device_enumerator() -> *mut IMMDeviceEnumerator {
     }
 }
 
-/// Scans active OS endpoints for `flow` (`E_RENDER` or `E_CAPTURE`) to find:
-/// 1) The active VR endpoint matching `profile` (or `custom_pattern` if provided)
-/// 2) The active non-VR Desktop endpoint (for fallback restore if needed)
+/// Role-specific desktop audio snapshot so users with distinct `eConsole`, `eMultimedia`,
+/// and `eCommunications` devices have each role restored to its exact pre-VR endpoint.
+struct RoleSnapshots {
+    render_console: FixedBuf<160>,
+    render_multimedia: FixedBuf<160>,
+    render_comm: FixedBuf<160>,
+    capture_console: FixedBuf<160>,
+    capture_multimedia: FixedBuf<160>,
+    capture_comm: FixedBuf<160>,
+}
+
+impl RoleSnapshots {
+    const fn new() -> Self {
+        Self {
+            render_console: FixedBuf::new(),
+            render_multimedia: FixedBuf::new(),
+            render_comm: FixedBuf::new(),
+            capture_console: FixedBuf::new(),
+            capture_multimedia: FixedBuf::new(),
+            capture_comm: FixedBuf::new(),
+        }
+    }
+
+    unsafe fn capture_initial(
+        &mut self,
+        enumerator: *mut IMMDeviceEnumerator,
+        profile: &VrAudioProfile,
+        custom_out: &[u8],
+        custom_in: &[u8],
+    ) {
+        unsafe {
+            let mut vr_out_id = FixedBuf::<160>::new();
+            let mut vr_out_name = FixedBuf::<160>::new();
+            let mut desk_out_id = FixedBuf::<160>::new();
+            let mut desk_out_name = FixedBuf::<160>::new();
+            resolve_active_endpoints(
+                enumerator,
+                E_RENDER,
+                profile,
+                custom_out,
+                &mut vr_out_id,
+                &mut vr_out_name,
+                &mut desk_out_id,
+                &mut desk_out_name,
+            );
+            let fallback_out = if !profile.desktop_playback_id.is_empty() {
+                profile.desktop_playback_id.as_bytes()
+            } else {
+                desk_out_id.as_bytes()
+            };
+
+            Self::snapshot_role(
+                enumerator,
+                E_RENDER,
+                E_CONSOLE,
+                profile,
+                custom_out,
+                fallback_out,
+                &mut self.render_console,
+            );
+            Self::snapshot_role(
+                enumerator,
+                E_RENDER,
+                E_MULTIMEDIA,
+                profile,
+                custom_out,
+                fallback_out,
+                &mut self.render_multimedia,
+            );
+            Self::snapshot_role(
+                enumerator,
+                E_RENDER,
+                E_COMMUNICATIONS,
+                profile,
+                custom_out,
+                fallback_out,
+                &mut self.render_comm,
+            );
+
+            let mut vr_in_id = FixedBuf::<160>::new();
+            let mut vr_in_name = FixedBuf::<160>::new();
+            let mut desk_in_id = FixedBuf::<160>::new();
+            let mut desk_in_name = FixedBuf::<160>::new();
+            resolve_active_endpoints(
+                enumerator,
+                E_CAPTURE,
+                profile,
+                custom_in,
+                &mut vr_in_id,
+                &mut vr_in_name,
+                &mut desk_in_id,
+                &mut desk_in_name,
+            );
+            let fallback_in = if !profile.desktop_record_id.is_empty() {
+                profile.desktop_record_id.as_bytes()
+            } else {
+                desk_in_id.as_bytes()
+            };
+
+            Self::snapshot_role(
+                enumerator,
+                E_CAPTURE,
+                E_CONSOLE,
+                profile,
+                custom_in,
+                fallback_in,
+                &mut self.capture_console,
+            );
+            Self::snapshot_role(
+                enumerator,
+                E_CAPTURE,
+                E_MULTIMEDIA,
+                profile,
+                custom_in,
+                fallback_in,
+                &mut self.capture_multimedia,
+            );
+            Self::snapshot_role(
+                enumerator,
+                E_CAPTURE,
+                E_COMMUNICATIONS,
+                profile,
+                custom_in,
+                fallback_in,
+                &mut self.capture_comm,
+            );
+        }
+    }
+
+    unsafe fn snapshot_role(
+        enumerator: *mut IMMDeviceEnumerator,
+        flow: DWORD,
+        role: DWORD,
+        profile: &VrAudioProfile,
+        custom_pat: &[u8],
+        fallback_desktop_id: &[u8],
+        out: &mut FixedBuf<160>,
+    ) {
+        let mut cur_id = FixedBuf::<160>::new();
+        let mut cur_name = FixedBuf::<160>::new();
+        if unsafe { get_default_endpoint(enumerator, flow, role, &mut cur_id, &mut cur_name) } {
+            let is_vr = if !custom_pat.is_empty() {
+                contains_ignore_ascii_case(cur_name.as_bytes(), custom_pat)
+                    || contains_ignore_ascii_case(cur_id.as_bytes(), custom_pat)
+            } else {
+                profile.matches_vr_name_or_id(cur_name.as_bytes(), cur_id.as_bytes(), b"")
+            };
+            if !is_vr {
+                out.set_bytes(cur_id.as_bytes());
+                return;
+            }
+        }
+        out.set_bytes(fallback_desktop_id);
+    }
+
+    unsafe fn restore(&self) {
+        unsafe {
+            set_endpoint_per_role(
+                self.render_console.as_bytes(),
+                self.render_multimedia.as_bytes(),
+                self.render_comm.as_bytes(),
+            );
+            set_endpoint_per_role(
+                self.capture_console.as_bytes(),
+                self.capture_multimedia.as_bytes(),
+                self.capture_comm.as_bytes(),
+            );
+        }
+    }
+}
+
 unsafe fn resolve_active_endpoints(
     enumerator: *mut IMMDeviceEnumerator,
     flow: DWORD,
@@ -1007,16 +1408,17 @@ unsafe fn list_flow_endpoints(
 }
 
 /// Purely event-driven VR audio session:
-/// 1. Snapshots non-VR desktop Output and Input endpoints.
+/// 1. Snapshots each role (`eConsole`, `eMultimedia`, `eCommunications`) independently for Output and Input.
 /// 2. Switches OS (`eConsole`, `eMultimedia`, `eCommunications`) + Discord to VR headset audio.
 /// 3. Registers `IMMNotificationClient` and sleeps on `WaitForMultipleObjects([hVrServer, hAudioEvent], INFINITE)`
 ///    at 0% CPU with zero polling.
-/// 4. When `vrserver.exe` exits, waits for `vrmonitor.exe` shutdown, restores Desktop Output & Input across all 3 roles, and exits.
+/// 4. When `vrserver.exe` exits, waits for `vrmonitor.exe` shutdown, restores each role to its snapshotted device, and exits.
 pub fn run_event_driven_vr_session(
     paths: Option<&SteamVrPaths>,
     mut profile: VrAudioProfile,
     custom_out: &[u8],
     custom_in: &[u8],
+    _move_all_streams: bool,
 ) {
     let (vrserver_pid, vrmonitor_pid) = find_process_pids();
     if vrserver_pid == 0 {
@@ -1045,25 +1447,9 @@ pub fn run_event_driven_vr_session(
             return;
         }
 
-        // Snapshot current OS default endpoints before switching.
-        // If current OS default is NOT already a VR endpoint, prefer it as the Desktop restore target!
-        let mut cur_out_id = FixedBuf::<160>::new();
-        let mut cur_out_name = FixedBuf::<160>::new();
-        if get_default_endpoint(enumerator, E_RENDER, E_CONSOLE, &mut cur_out_id, &mut cur_out_name) {
-            if !profile.matches_vr_name_or_id(cur_out_name.as_bytes(), cur_out_id.as_bytes(), b"") {
-                profile.desktop_playback_id.set_bytes(cur_out_id.as_bytes());
-                profile.desktop_playback_name.set_bytes(cur_out_name.as_bytes());
-            }
-        }
-
-        let mut cur_in_id = FixedBuf::<160>::new();
-        let mut cur_in_name = FixedBuf::<160>::new();
-        if get_default_endpoint(enumerator, E_CAPTURE, E_CONSOLE, &mut cur_in_id, &mut cur_in_name) {
-            if !profile.matches_vr_name_or_id(cur_in_name.as_bytes(), cur_in_id.as_bytes(), b"") {
-                profile.desktop_record_id.set_bytes(cur_in_id.as_bytes());
-                profile.desktop_record_name.set_bytes(cur_in_name.as_bytes());
-            }
-        }
+        // Snapshot each role (eConsole, eMultimedia, eCommunications) independently
+        let mut snapshots = RoleSnapshots::new();
+        snapshots.capture_initial(enumerator, &profile, custom_out, custom_in);
 
         // Create kernel auto-reset event for IMMNotificationClient callbacks
         let h_audio_event = CreateEventW(null_mut(), 0, 0, null());
@@ -1073,8 +1459,9 @@ pub fn run_event_driven_vr_session(
         let client_ptr: *mut IMMNotificationClient = &raw mut NOTIFICATION_CLIENT;
         let _ = (vtbl.RegisterEndpointNotificationCallback)(enumerator as *mut c_void, client_ptr);
 
-        // Perform initial sync to VR audio endpoints
+        // Perform initial sync to VR audio endpoints and unload any unused transient COM DLLs
         sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
+        CoFreeUnusedLibrariesEx(0, 0);
 
         // Purely event-driven kernel wait (0% CPU, zero polling, infinite timeout)
         let handles = [h_vrserver, h_audio_event];
@@ -1106,69 +1493,29 @@ pub fn run_event_driven_vr_session(
         }
         CloseHandle(h_vrserver);
 
-        // Restore pre-VR Desktop Output & Input across all 3 roles (eConsole, eMultimedia, eCommunications)
-        if !profile.desktop_playback_id.is_empty() {
-            let _ = set_default_endpoint_all_roles(profile.desktop_playback_id.as_bytes());
-        }
-        if !profile.desktop_record_id.is_empty() {
-            let _ = set_default_endpoint_all_roles(profile.desktop_record_id.as_bytes());
-        }
+        // Restore each role (eConsole, eMultimedia, eCommunications) to its own pre-VR endpoint
+        snapshots.restore();
 
         (vtbl.Release)(enumerator as *mut c_void);
     }
 }
 
-pub fn ensure_desktop_audio(profile: &VrAudioProfile, custom_out: &[u8], custom_in: &[u8]) {
+/// Repairs any role (`eConsole`, `eMultimedia`, `eCommunications`) that is currently stuck on a VR endpoint
+/// while SteamVR is closed, without overwriting roles that are already assigned to non-VR desktop devices.
+pub fn ensure_desktop_audio(
+    profile: &VrAudioProfile,
+    custom_out: &[u8],
+    custom_in: &[u8],
+    _move_all_streams: bool,
+) {
     unsafe {
         let enumerator = create_device_enumerator();
         if enumerator.is_null() {
             return;
         }
-        let mut vr_out_id = FixedBuf::<160>::new();
-        let mut vr_out_name = FixedBuf::<160>::new();
-        let mut desk_out_id = FixedBuf::<160>::new();
-        let mut desk_out_name = FixedBuf::<160>::new();
-        resolve_active_endpoints(
-            enumerator,
-            E_RENDER,
-            profile,
-            custom_out,
-            &mut vr_out_id,
-            &mut vr_out_name,
-            &mut desk_out_id,
-            &mut desk_out_name,
-        );
-        let target_out = if !profile.desktop_playback_id.is_empty() {
-            profile.desktop_playback_id.as_bytes()
-        } else {
-            desk_out_id.as_bytes()
-        };
-        if !target_out.is_empty() {
-            let _ = set_default_endpoint_all_roles(target_out);
-        }
-
-        let mut vr_in_id = FixedBuf::<160>::new();
-        let mut vr_in_name = FixedBuf::<160>::new();
-        let mut desk_in_id = FixedBuf::<160>::new();
-        let mut desk_in_name = FixedBuf::<160>::new();
-        resolve_active_endpoints(
-            enumerator,
-            E_CAPTURE,
-            profile,
-            custom_in,
-            &mut vr_in_id,
-            &mut vr_in_name,
-            &mut desk_in_id,
-            &mut desk_in_name,
-        );
-        let target_in = if !profile.desktop_record_id.is_empty() {
-            profile.desktop_record_id.as_bytes()
-        } else {
-            desk_in_id.as_bytes()
-        };
-        if !target_in.is_empty() {
-            let _ = set_default_endpoint_all_roles(target_in);
-        }
+        let mut snapshots = RoleSnapshots::new();
+        snapshots.capture_initial(enumerator, profile, custom_out, custom_in);
+        snapshots.restore();
 
         let vtbl = &*(*enumerator).lpVtbl;
         (vtbl.Release)(enumerator as *mut c_void);
@@ -1182,7 +1529,6 @@ unsafe fn sync_vr_endpoints(
     custom_out: &[u8],
     custom_in: &[u8],
 ) {
-    // Re-read vrmonitor.txt if VR playback/record IDs were not yet populated at initial startup
     if (profile.vr_playback_id.is_empty() || profile.vr_record_id.is_empty())
         && let Some(p) = paths
     {
@@ -1219,7 +1565,6 @@ unsafe fn sync_vr_endpoints(
             profile.desktop_playback_name.set_bytes(active_desk_out_name.as_bytes());
         }
 
-        // If SteamVR switched eConsole to a non-desktop device, treat that as the active VR playback device
         if active_vr_out_id.is_empty() {
             let mut con_id = FixedBuf::<160>::new();
             let mut con_name = FixedBuf::<160>::new();
@@ -1234,7 +1579,6 @@ unsafe fn sync_vr_endpoints(
         }
 
         if !active_vr_out_id.is_empty() {
-            // Check if eConsole or eCommunications is not yet set to active_vr_out_id
             let mut comm_id = FixedBuf::<160>::new();
             let mut comm_name = FixedBuf::<160>::new();
             let _ = get_default_endpoint(
@@ -1255,7 +1599,6 @@ unsafe fn sync_vr_endpoints(
             }
         }
 
-        // Now resolve and sync Recording (Input / Microphone)
         let mut active_vr_in_id = FixedBuf::<160>::new();
         let mut active_vr_in_name = FixedBuf::<160>::new();
         let mut active_desk_in_id = FixedBuf::<160>::new();
