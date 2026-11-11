@@ -6,7 +6,8 @@ use core::ptr::{null, null_mut};
 
 use crate::steamvr::{SteamVrPaths, VrAudioProfile};
 use crate::str_buf::{
-    FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case, find_subslice, trim_ascii,
+    EndpointAction, EndpointRoleState, FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case,
+    find_subslice, trim_ascii,
 };
 
 pub const PATH_SEP: char = '/';
@@ -811,8 +812,30 @@ pub fn run_event_driven_vr_session(
             snap_src.set_bytes(desk_src.as_bytes());
         }
 
+        // Initialize dynamic session state to track manual desktop switching vs HMD disconnect
+        let mut session_sink = EndpointRoleState::new();
+        let mut session_src = EndpointRoleState::new();
+
         // Initial switch to VR audio + move Discord streams
-        switch_linux_audio(vr_sink.as_bytes(), vr_src.as_bytes(), move_all_streams);
+        let sink_act = session_sink.evaluate_transition(
+            vr_sink.as_bytes(),
+            snap_sink.as_bytes(),
+            snap_sink.as_bytes(),
+            snap_sink.as_bytes(),
+        );
+        if let EndpointAction::EngageVr(s) = sink_act {
+            switch_linux_audio(s, b"", move_all_streams);
+        }
+
+        let src_act = session_src.evaluate_transition(
+            vr_src.as_bytes(),
+            snap_src.as_bytes(),
+            snap_src.as_bytes(),
+            snap_src.as_bytes(),
+        );
+        if let EndpointAction::EngageVr(s) = src_act {
+            switch_linux_audio(b"", s, move_all_streams);
+        }
 
         // Spawn `pactl subscribe` to receive real-time PipeWire/PulseAudio events without polling
         let mut pfd = [-1i32; 2];
@@ -899,11 +922,77 @@ pub fn run_event_driven_vr_session(
                                 &mut desk_src,
                                 &mut desk_src_desc,
                             );
-                            switch_linux_audio(
+
+                            let mut cur_sink = FixedBuf::<160>::new();
+                            let mut cur_src = FixedBuf::<160>::new();
+                            get_pactl_default(b"get-default-sink", &mut cur_sink);
+                            get_pactl_default(b"get-default-source", &mut cur_src);
+
+                            let sink_act = session_sink.evaluate_transition(
                                 vr_sink.as_bytes(),
-                                vr_src.as_bytes(),
-                                move_all_streams,
+                                cur_sink.as_bytes(),
+                                cur_sink.as_bytes(),
+                                snap_sink.as_bytes(),
                             );
+                            match sink_act {
+                                EndpointAction::EngageVr(s) => {
+                                    switch_linux_audio(s, b"", move_all_streams);
+                                }
+                                EndpointAction::RestoreDesktop => {
+                                    let desk = if !snap_sink.is_empty() {
+                                        snap_sink.as_bytes()
+                                    } else {
+                                        desk_sink.as_bytes()
+                                    };
+                                    if !desk.is_empty() {
+                                        switch_linux_audio(desk, b"", move_all_streams);
+                                    }
+                                }
+                                EndpointAction::ManualDesktop { .. } => {
+                                    if !cur_sink.is_empty() {
+                                        snap_sink.set_bytes(cur_sink.as_bytes());
+                                    }
+                                }
+                                EndpointAction::ResumeVr { .. } => {
+                                    if !vr_sink.is_empty() {
+                                        switch_linux_audio(vr_sink.as_bytes(), b"", move_all_streams);
+                                    }
+                                }
+                                EndpointAction::NoAction => {}
+                            }
+
+                            let src_act = session_src.evaluate_transition(
+                                vr_src.as_bytes(),
+                                cur_src.as_bytes(),
+                                cur_src.as_bytes(),
+                                snap_src.as_bytes(),
+                            );
+                            match src_act {
+                                EndpointAction::EngageVr(s) => {
+                                    switch_linux_audio(b"", s, move_all_streams);
+                                }
+                                EndpointAction::RestoreDesktop => {
+                                    let desk = if !snap_src.is_empty() {
+                                        snap_src.as_bytes()
+                                    } else {
+                                        desk_src.as_bytes()
+                                    };
+                                    if !desk.is_empty() {
+                                        switch_linux_audio(b"", desk, move_all_streams);
+                                    }
+                                }
+                                EndpointAction::ManualDesktop { .. } => {
+                                    if !cur_src.is_empty() {
+                                        snap_src.set_bytes(cur_src.as_bytes());
+                                    }
+                                }
+                                EndpointAction::ResumeVr { .. } => {
+                                    if !vr_src.is_empty() {
+                                        switch_linux_audio(b"", vr_src.as_bytes(), move_all_streams);
+                                    }
+                                }
+                                EndpointAction::NoAction => {}
+                            }
                         }
                     } else {
                         pipe_closed = true;

@@ -1,5 +1,6 @@
 use core::fmt::{self, Write};
 
+#[derive(Copy, Clone)]
 pub struct FixedBuf<const N: usize> {
     pub buf: [u8; N],
     pub len: usize,
@@ -843,6 +844,118 @@ pub fn update_appconfig_manifest_paths(
     Some(pos)
 }
 
+/// Action decided by the endpoint role reconciliation state machine
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum EndpointAction<'a> {
+    NoAction,
+    EngageVr(&'a [u8]),
+    RestoreDesktop,
+    ManualDesktop { sync_comm: Option<&'a [u8]> },
+    ResumeVr { sync_comm: &'a [u8] },
+}
+
+/// Dynamic session tracker per audio role (Render/Output or Capture/Input).
+/// Differentiates between:
+/// 1. The HMD losing its audio device (unplugged, powered off, wireless link dropped) -> restore desktop audio.
+/// 2. The user manually switching default audio to a desktop device -> respect user choice, do NOT fight them.
+/// 3. The user switching back to the HMD -> resume VR routing and sync communications (Discord).
+#[derive(Clone)]
+pub struct EndpointRoleState {
+    pub vr_engaged: bool,
+    pub user_manual_desktop: bool,
+    pub last_vr_id: FixedBuf<160>,
+}
+
+impl EndpointRoleState {
+    pub const fn new() -> Self {
+        Self {
+            vr_engaged: false,
+            user_manual_desktop: false,
+            last_vr_id: FixedBuf::new(),
+        }
+    }
+
+    pub fn evaluate_transition<'a>(
+        &mut self,
+        active_vr_id: &'a [u8],
+        cur_con_id: &'a [u8],
+        cur_comm_id: &'a [u8],
+        snap_comm_id: &'a [u8],
+    ) -> EndpointAction<'a> {
+        if active_vr_id.is_empty() {
+            if self.vr_engaged || !self.last_vr_id.is_empty() {
+                // HMD lost audio device (unplugged, turned off, link dropped)
+                self.vr_engaged = false;
+                self.user_manual_desktop = false;
+                self.last_vr_id.clear();
+                return EndpointAction::RestoreDesktop;
+            }
+            return EndpointAction::NoAction;
+        }
+
+        let vr_changed = self.last_vr_id.is_empty()
+            || !eq_ignore_ascii_case(active_vr_id, self.last_vr_id.as_bytes());
+
+        if vr_changed {
+            // VR headset audio device newly connected or changed -> engage VR
+            self.vr_engaged = true;
+            self.user_manual_desktop = false;
+            self.last_vr_id.set_bytes(active_vr_id);
+            return EndpointAction::EngageVr(active_vr_id);
+        }
+
+        if !cur_con_id.is_empty() && eq_ignore_ascii_case(cur_con_id, active_vr_id) {
+            // Default device is the VR headset
+            if self.user_manual_desktop {
+                // User manually switched back to VR headset in OS audio settings
+                self.user_manual_desktop = false;
+                self.vr_engaged = true;
+                return EndpointAction::ResumeVr {
+                    sync_comm: active_vr_id,
+                };
+            }
+            // If already on VR, make sure eCommunications (Discord) is also on VR
+            if !cur_comm_id.is_empty() && !eq_ignore_ascii_case(cur_comm_id, active_vr_id) {
+                return EndpointAction::ResumeVr {
+                    sync_comm: active_vr_id,
+                };
+            }
+            return EndpointAction::NoAction;
+        }
+
+        // VR headset is still active and connected, but cur_con_id is NOT the VR headset!
+        if self.vr_engaged || self.user_manual_desktop {
+            // User manually switched default audio to a desktop device!
+            self.user_manual_desktop = true;
+
+            // If eCommunications is still stuck on the VR headset, move it to desktop
+            if !cur_comm_id.is_empty() && eq_ignore_ascii_case(cur_comm_id, active_vr_id) {
+                let target_comm = if !snap_comm_id.is_empty()
+                    && !eq_ignore_ascii_case(snap_comm_id, active_vr_id)
+                {
+                    snap_comm_id
+                } else if !cur_con_id.is_empty() {
+                    cur_con_id
+                } else {
+                    b""
+                };
+                if !target_comm.is_empty() {
+                    return EndpointAction::ManualDesktop {
+                        sync_comm: Some(target_comm),
+                    };
+                }
+            }
+            return EndpointAction::ManualDesktop { sync_comm: None };
+        }
+
+        // Initial/fallback engagement when VR device is present
+        self.vr_engaged = true;
+        self.user_manual_desktop = false;
+        self.last_vr_id.set_bytes(active_vr_id);
+        EndpointAction::EngageVr(active_vr_id)
+    }
+}
+
 /// Self-test suite verifying `update_appconfig_manifest_paths` and `parse_windows_cmdline_utf16`
 /// against malformed JSON, missing `manifest_paths`, escaped quotes/brackets, and oversized inputs.
 pub fn run_self_tests() -> bool {
@@ -970,6 +1083,53 @@ pub fn run_self_tests() -> bool {
         || parsed_args[3].as_bytes() != b"--input"
         || parsed_args[4].as_bytes() != b"C:\\\\Trailing\\\"Quote\"Test"
     {
+        return false;
+    }
+
+    // 7. Dynamic endpoint role state machine transitions:
+    //    Differentiates manual desktop switching vs HMD disconnect vs reconnect
+    let mut state = EndpointRoleState::new();
+
+    // 7a. Initial startup with VR device present -> engages VR
+    let act1 = state.evaluate_transition(b"VR_HMD", b"DESK_SPK", b"DESK_COMM", b"DESK_COMM");
+    if act1 != EndpointAction::EngageVr(b"VR_HMD") || !state.vr_engaged || state.user_manual_desktop {
+        return false;
+    }
+
+    // 7b. Steady state in VR -> NoAction
+    let act2 = state.evaluate_transition(b"VR_HMD", b"VR_HMD", b"VR_HMD", b"DESK_COMM");
+    if act2 != EndpointAction::NoAction {
+        return false;
+    }
+
+    // 7c. User manually switches default device to desktop thingy while HMD is still active
+    //     -> respects manual desktop, routes comms to desktop, DOES NOT autoswap back to VR!
+    let act3 = state.evaluate_transition(b"VR_HMD", b"DESK_SPK", b"VR_HMD", b"DESK_COMM");
+    if act3 != (EndpointAction::ManualDesktop { sync_comm: Some(b"DESK_COMM") }) || !state.user_manual_desktop {
+        return false;
+    }
+
+    // 7d. User switches to a different desktop device -> remains on manual desktop without re-engaging VR
+    let act4 = state.evaluate_transition(b"VR_HMD", b"DESK_HP", b"DESK_COMM", b"DESK_COMM");
+    if act4 != (EndpointAction::ManualDesktop { sync_comm: None }) || !state.user_manual_desktop {
+        return false;
+    }
+
+    // 7e. User switches back to HMD -> resumes VR and syncs comms to VR
+    let act5 = state.evaluate_transition(b"VR_HMD", b"VR_HMD", b"DESK_COMM", b"DESK_COMM");
+    if act5 != (EndpointAction::ResumeVr { sync_comm: b"VR_HMD" }) || state.user_manual_desktop || !state.vr_engaged {
+        return false;
+    }
+
+    // 7f. HMD loses audio device (unplugged / powered off / wireless dropped) -> restores desktop
+    let act6 = state.evaluate_transition(b"", b"DESK_SPK", b"DESK_SPK", b"DESK_COMM");
+    if act6 != EndpointAction::RestoreDesktop || state.vr_engaged || state.user_manual_desktop || !state.last_vr_id.is_empty() {
+        return false;
+    }
+
+    // 7g. HMD reconnected later -> auto-switches to HMD
+    let act7 = state.evaluate_transition(b"VR_HMD", b"DESK_SPK", b"DESK_SPK", b"DESK_COMM");
+    if act7 != EndpointAction::EngageVr(b"VR_HMD") || !state.vr_engaged || state.user_manual_desktop {
         return false;
     }
 

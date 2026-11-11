@@ -7,8 +7,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::steamvr::{SteamVrPaths, VrAudioProfile};
 use crate::str_buf::{
-    FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case, parse_windows_cmdline_utf16,
-    utf8_to_utf16_null, utf16_to_utf8,
+    EndpointAction, EndpointRoleState, FixedBuf, contains_ignore_ascii_case, eq_ignore_ascii_case,
+    parse_windows_cmdline_utf16, utf8_to_utf16_null, utf16_to_utf8,
 };
 
 pub const PATH_SEP: char = '\\';
@@ -1151,18 +1151,30 @@ impl RoleSnapshots {
         out.set_bytes(fallback_desktop_id);
     }
 
-    unsafe fn restore(&self) {
+    unsafe fn restore_render(&self) {
         unsafe {
             set_endpoint_per_role(
                 self.render_console.as_bytes(),
                 self.render_multimedia.as_bytes(),
                 self.render_comm.as_bytes(),
             );
+        }
+    }
+
+    unsafe fn restore_capture(&self) {
+        unsafe {
             set_endpoint_per_role(
                 self.capture_console.as_bytes(),
                 self.capture_multimedia.as_bytes(),
                 self.capture_comm.as_bytes(),
             );
+        }
+    }
+
+    unsafe fn restore(&self) {
+        unsafe {
+            self.restore_render();
+            self.restore_capture();
         }
     }
 
@@ -1508,6 +1520,11 @@ pub fn run_event_driven_vr_session(
         let mut snapshots = RoleSnapshots::new();
         snapshots.capture_initial(enumerator, &profile, custom_out, custom_in);
 
+        let mut session = WindowsSessionState {
+            render: EndpointRoleState::new(),
+            capture: EndpointRoleState::new(),
+        };
+
         // Create kernel auto-reset event for IMMNotificationClient callbacks
         let h_audio_event = CreateEventW(null_mut(), 0, 0, null());
         let vtbl = &*(*enumerator).lpVtbl;
@@ -1526,7 +1543,15 @@ pub fn run_event_driven_vr_session(
         }
 
         // Perform initial sync to VR audio endpoints and unload any unused transient COM DLLs
-        sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
+        sync_vr_endpoints(
+            enumerator,
+            paths,
+            &mut profile,
+            custom_out,
+            custom_in,
+            &mut session,
+            &mut snapshots,
+        );
         CoFreeUnusedLibrariesEx(0, 0);
 
         // Purely event-driven kernel wait (negligible idle CPU, zero polling, infinite timeout)
@@ -1538,8 +1563,16 @@ pub fn run_event_driven_vr_session(
                     // vrserver.exe has terminated!
                     break;
                 } else if wait_res == WAIT_OBJECT_0 + 1 {
-                    // Audio device plugged/removed or SteamVR changed eConsole/eMultimedia -> sync eCommunications + VR audio
-                    sync_vr_endpoints(enumerator, paths, &mut profile, custom_out, custom_in);
+                    // Audio device plugged/removed or default device changed
+                    sync_vr_endpoints(
+                        enumerator,
+                        paths,
+                        &mut profile,
+                        custom_out,
+                        custom_in,
+                        &mut session,
+                        &mut snapshots,
+                    );
                 } else {
                     break;
                 }
@@ -1625,12 +1658,19 @@ pub fn ensure_desktop_audio(
     }
 }
 
+struct WindowsSessionState {
+    render: EndpointRoleState,
+    capture: EndpointRoleState,
+}
+
 unsafe fn sync_vr_endpoints(
     enumerator: *mut IMMDeviceEnumerator,
     paths: Option<&SteamVrPaths>,
     profile: &mut VrAudioProfile,
     custom_out: &[u8],
     custom_in: &[u8],
+    session: &mut WindowsSessionState,
+    snapshots: &mut RoleSnapshots,
 ) {
     if (profile.vr_playback_id.is_empty() || profile.vr_record_id.is_empty())
         && let Some(p) = paths
@@ -1647,6 +1687,7 @@ unsafe fn sync_vr_endpoints(
     }
 
     unsafe {
+        // --- 1. Playback / Output (E_RENDER) ---
         let mut active_vr_out_id = FixedBuf::<160>::new();
         let mut active_vr_out_name = FixedBuf::<160>::new();
         let mut active_desk_out_id = FixedBuf::<160>::new();
@@ -1668,40 +1709,56 @@ unsafe fn sync_vr_endpoints(
             profile.desktop_playback_name.set_bytes(active_desk_out_name.as_bytes());
         }
 
-        if active_vr_out_id.is_empty() {
-            let mut con_id = FixedBuf::<160>::new();
-            let mut con_name = FixedBuf::<160>::new();
-            if get_default_endpoint(enumerator, E_RENDER, E_CONSOLE, &mut con_id, &mut con_name) {
-                if !profile.desktop_playback_id.is_empty()
-                    && !eq_ignore_ascii_case(con_id.as_bytes(), profile.desktop_playback_id.as_bytes())
-                {
-                    active_vr_out_id.set_bytes(con_id.as_bytes());
-                    active_vr_out_name.set_bytes(con_name.as_bytes());
+        let mut cur_con_out_id = FixedBuf::<160>::new();
+        let mut cur_con_out_name = FixedBuf::<160>::new();
+        let _ = get_default_endpoint(
+            enumerator,
+            E_RENDER,
+            E_CONSOLE,
+            &mut cur_con_out_id,
+            &mut cur_con_out_name,
+        );
+
+        let mut cur_comm_out_id = FixedBuf::<160>::new();
+        let mut cur_comm_out_name = FixedBuf::<160>::new();
+        let _ = get_default_endpoint(
+            enumerator,
+            E_RENDER,
+            E_COMMUNICATIONS,
+            &mut cur_comm_out_id,
+            &mut cur_comm_out_name,
+        );
+
+        let out_action = session.render.evaluate_transition(
+            active_vr_out_id.as_bytes(),
+            cur_con_out_id.as_bytes(),
+            cur_comm_out_id.as_bytes(),
+            snapshots.render_comm.as_bytes(),
+        );
+
+        match out_action {
+            EndpointAction::EngageVr(id) => {
+                let _ = set_default_endpoint_all_roles(id);
+            }
+            EndpointAction::RestoreDesktop => {
+                snapshots.restore_render();
+            }
+            EndpointAction::ManualDesktop { sync_comm } => {
+                if let Some(target_comm) = sync_comm {
+                    set_endpoint_per_role(b"", b"", target_comm);
+                }
+                if !cur_con_out_id.is_empty() {
+                    snapshots.render_console.set_bytes(cur_con_out_id.as_bytes());
+                    snapshots.render_multimedia.set_bytes(cur_con_out_id.as_bytes());
                 }
             }
-        }
-
-        if !active_vr_out_id.is_empty() {
-            let mut comm_id = FixedBuf::<160>::new();
-            let mut comm_name = FixedBuf::<160>::new();
-            let _ = get_default_endpoint(
-                enumerator,
-                E_RENDER,
-                E_COMMUNICATIONS,
-                &mut comm_id,
-                &mut comm_name,
-            );
-            let mut con_id = FixedBuf::<160>::new();
-            let mut con_name = FixedBuf::<160>::new();
-            let _ = get_default_endpoint(enumerator, E_RENDER, E_CONSOLE, &mut con_id, &mut con_name);
-
-            if !eq_ignore_ascii_case(comm_id.as_bytes(), active_vr_out_id.as_bytes())
-                || !eq_ignore_ascii_case(con_id.as_bytes(), active_vr_out_id.as_bytes())
-            {
-                let _ = set_default_endpoint_all_roles(active_vr_out_id.as_bytes());
+            EndpointAction::ResumeVr { sync_comm } => {
+                set_endpoint_per_role(b"", b"", sync_comm);
             }
+            EndpointAction::NoAction => {}
         }
 
+        // --- 2. Recording / Input (E_CAPTURE) ---
         let mut active_vr_in_id = FixedBuf::<160>::new();
         let mut active_vr_in_name = FixedBuf::<160>::new();
         let mut active_desk_in_id = FixedBuf::<160>::new();
@@ -1723,25 +1780,53 @@ unsafe fn sync_vr_endpoints(
             profile.desktop_record_name.set_bytes(active_desk_in_name.as_bytes());
         }
 
-        if !active_vr_in_id.is_empty() {
-            let mut comm_id = FixedBuf::<160>::new();
-            let mut comm_name = FixedBuf::<160>::new();
-            let _ = get_default_endpoint(
-                enumerator,
-                E_CAPTURE,
-                E_COMMUNICATIONS,
-                &mut comm_id,
-                &mut comm_name,
-            );
-            let mut con_id = FixedBuf::<160>::new();
-            let mut con_name = FixedBuf::<160>::new();
-            let _ = get_default_endpoint(enumerator, E_CAPTURE, E_CONSOLE, &mut con_id, &mut con_name);
+        let mut cur_con_in_id = FixedBuf::<160>::new();
+        let mut cur_con_in_name = FixedBuf::<160>::new();
+        let _ = get_default_endpoint(
+            enumerator,
+            E_CAPTURE,
+            E_CONSOLE,
+            &mut cur_con_in_id,
+            &mut cur_con_in_name,
+        );
 
-            if !eq_ignore_ascii_case(comm_id.as_bytes(), active_vr_in_id.as_bytes())
-                || !eq_ignore_ascii_case(con_id.as_bytes(), active_vr_in_id.as_bytes())
-            {
-                let _ = set_default_endpoint_all_roles(active_vr_in_id.as_bytes());
+        let mut cur_comm_in_id = FixedBuf::<160>::new();
+        let mut cur_comm_in_name = FixedBuf::<160>::new();
+        let _ = get_default_endpoint(
+            enumerator,
+            E_CAPTURE,
+            E_COMMUNICATIONS,
+            &mut cur_comm_in_id,
+            &mut cur_comm_in_name,
+        );
+
+        let in_action = session.capture.evaluate_transition(
+            active_vr_in_id.as_bytes(),
+            cur_con_in_id.as_bytes(),
+            cur_comm_in_id.as_bytes(),
+            snapshots.capture_comm.as_bytes(),
+        );
+
+        match in_action {
+            EndpointAction::EngageVr(id) => {
+                let _ = set_default_endpoint_all_roles(id);
             }
+            EndpointAction::RestoreDesktop => {
+                snapshots.restore_capture();
+            }
+            EndpointAction::ManualDesktop { sync_comm } => {
+                if let Some(target_comm) = sync_comm {
+                    set_endpoint_per_role(b"", b"", target_comm);
+                }
+                if !cur_con_in_id.is_empty() {
+                    snapshots.capture_console.set_bytes(cur_con_in_id.as_bytes());
+                    snapshots.capture_multimedia.set_bytes(cur_con_in_id.as_bytes());
+                }
+            }
+            EndpointAction::ResumeVr { sync_comm } => {
+                set_endpoint_per_role(b"", b"", sync_comm);
+            }
+            EndpointAction::NoAction => {}
         }
     }
 }
